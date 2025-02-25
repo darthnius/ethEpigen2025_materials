@@ -1,0 +1,13 @@
+---
+title: "assignment"
+author: "Nils Schlatter"
+date: "2025-02-24"
+output: html_document
+---
+```{r}
+
+library(epiwraps)
+sessionInfo()
+
+
+```
