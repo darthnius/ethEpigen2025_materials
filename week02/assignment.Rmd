@@ -1,0 +1,62 @@
+---
+title: "assignment"
+author: "Nils Schlatter"
+date: "2025-02-24"
+output: html_document
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(AnnotationHub)
+  library(ensembldb)
+  library(GenomicRanges)
+  library(epiwraps)
+  library(ggplot2)
+})
+```
+```{r}
+# Create ah object
+ah <- AnnotationHub()
+
+# Query for mouse EnsDb (v 102, GRCm38)
+mouse_ensdb_query <- query(ah, c("EnsDb", "Mus musculus", "102", "GRCm38"))
+mouse_ensdb <- mouse_ensdb_query[[1]]
+
+# Query for mouse genome sequence in GRCm38
+mouse_genome_query <- query(ah, c("TwoBit", "Mus musculus", "GRCm38"))
+mouse_genome <- mouse_genome_query[[1]]
+
+# Query for drosophila genome sequence in BDGP6
+drosophila_genome_query <- query(ah, c("TwoBit", "Drosophila melanogaster", "BDGP6"))
+drosophila_genome <- drosophila_genome_query[[1]]
+```
+```{r}
+# Select only protein-coding genes
+protein_coding_genes <- genes(mouse_ensdb, filter = ~ gene_biotype == "protein_coding")
+
+num_gene_ids <- length(unique(protein_coding_genes$gene_id))
+num_gene_symbols <- length(unique(protein_coding_genes$gene_name))
+
+cat("Number of unique gene IDs for protein-coding genes:", num_gene_ids, "\n")
+cat("Number of unique gene symbols for protein-coding genes:", num_gene_symbols, "\n")
+```
+
+```{r}
+
+# Extract exons for protein-coding transcripts
+exons <- exons(mouse_ensdb, filter = ~ tx_biotype == "protein_coding", columns = c("exon_id", "tx_id"))
+
+# Group exons by transcript
+exons_by_tx <- split(exons, exons$tx_id)
+
+# Calculate spliced length of each transcript
+tx_lengths <- sapply(exons_by_tx, function(x) sum(width(x)))
+
+# Plot histogram
+ggplot(data.frame(Length = tx_lengths), aes(x = Length)) +
+  geom_histogram(binwidth = 500, fill = "blue", color = "black") +
+  labs(title = "Distribution of Spliced Transcript Lengths (Protein-Coding Genes)",
+       x = "Transcript Length (bp)",
+       y = "Frequency") +
+  theme_minimal()
+```
