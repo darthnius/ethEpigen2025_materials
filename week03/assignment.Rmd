@@ -1,0 +1,102 @@
+---
+title: "assignment"
+author: "Nils Schlatter"
+date: "2025-02-24"
+output: html_document
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(AnnotationHub)
+  library(ensembldb)
+  library(GenomicRanges)
+  library(epiwraps)
+  library(Rsubread)
+  library(rtracklayer)
+  library(Biostrings)
+  library(Rfastp)
+  #library(MACSr)
+})
+```
+```{r}
+options(timeout = 3600)
+
+dir.create("raw")
+
+download.file(
+  url = "https://www.encodeproject.org/files/ENCFF127RRR/@@download/ENCFF127RRR.fastq.gz",
+  destfile = "raw/CTCF.fastq.gz",
+  mode = "wb"
+)
+```
+
+```{r}
+dir.create("trimmed")
+
+qc <- Rfastp::rfastp(
+  read1 = "raw/CTCF.fastq.gz",
+  outputFastq = "trimmed/CTCF.fastq.gz",
+  thread = 4,
+  overrepresentationAnalysis = TRUE
+)
+
+Rfastp::curvePlot(qc, curve = "content_curves")
+```
+```{r}
+dir.create("aligned")
+
+ah <- AnnotationHub()
+genome <- ah[["AH49674"]]
+
+dir.create("BDGP6_genome")
+export(import.2bit(genome), "BDGP6_genome/genome.fasta.gz", compress = TRUE)
+Rsubread::buildindex("BDGP6_genome/rsubread", reference = "BDGP6_genome/genome.fasta.gz")
+
+align.stats <- Rsubread::align(
+  index = "BDGP6_genome/rsubread",
+  readfile1 = "trimmed/CTCF.fastq.gz_R1.fastq.gz",
+  output_file = "aligned/CTCF.bam",
+  nthreads = 4,
+  sortReadsByCoordinates = TRUE
+)
+
+align.stats
+```
+```{r}
+peaks <- callPeaks(bam="aligned/CTCF.bam")
+
+print(paste("Number of peaks found:", length(peaks)))
+```
+
+
+```{r}
+total_reads <- align.stats$CTCF.bam[1]
+mapped_reads <- align.stats$CTCF.bam[2]
+mapped_percentage <- (mapped_reads / total_reads) * 100
+
+print(paste("Total reads:", total_reads))
+print(paste("Mapped reads:", mapped_reads))
+print(paste("Percentage of mapped reads:", round(mapped_percentage, 2), "%"))
+
+print(paste("Number of peaks found:", length(peaks)))
+
+
+seq_info <- seqinfo(genome)
+
+grgenes <- GRanges(
+  seqnames = seqnames(seq_info),
+  ranges = IRanges(start = 1, end = seqlengths(seq_info)),
+  strand = "*",
+  seqinfo = seq_info
+)
+
+overlapping_peaks <- subsetByOverlaps(peaks, grgenes)
+
+plotSignalTracks(
+    list(CTCF = "aligned/CTCF.bam", peaks = overlapping_peaks),
+    region = overlapping_peaks[1],
+    extend = 5000,
+    tracks.params = list(ylim = c(0, 50))
+  )
+
+```
