@@ -1,0 +1,104 @@
+---
+title: "assignment"
+author: "Nils Schlatter"
+date: "2025-02-24"
+output: html_document
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(AnnotationHub)
+  library(ensembldb)
+  library(GenomicRanges)
+  library(epiwraps)
+  library(Rsubread)
+  library(rtracklayer)
+  library(Biostrings)
+  library(Rfastp)
+})
+```
+```{r}
+options(timeout = 3600)
+
+dir.create("peaks")
+
+download.file(
+  url = "https://www.encodeproject.org/files/ENCFF653YVR/@@download/ENCFF653YVR.bed.gz",
+  destfile = "peaks/p300.bed.gz",
+  mode = "wb"
+)
+
+download.file(
+  url = "https://www.encodeproject.org/files/ENCFF683EEE/@@download/ENCFF683EEE.bed.gz",
+  destfile = "peaks/H3K4me3.bed.gz",
+  mode = "wb"
+)
+
+download.file(
+  url = "https://www.encodeproject.org/files/ENCFF333IJH/@@download/ENCFF333IJH.bed.gz",
+  destfile = "peaks/H3K4me1.bed.gz",
+  mode = "wb"
+)
+
+download.file(
+  url = "https://www.encodeproject.org/files/ENCFF076OPI/@@download/ENCFF076OPI.bed.gz",
+  destfile = "peaks/H3K27ac.bed.gz",
+  mode = "wb"
+)
+
+download.file(
+  url = "https://www.encodeproject.org/files/ENCFF266LHB/@@download/ENCFF266LHB.bed.gz",
+  destfile = "peaks/H3K27me3.bed.gz",
+  mode = "wb"
+)
+```
+
+```{r}
+load_bed_gz <- function(file_path) {
+  con <- gzfile(file_path, open = "r")
+  
+  data <- read.table(con, sep = "\t", header = FALSE, stringsAsFactors = FALSE)
+  
+  close(con)
+  
+  granges <- GRanges(
+    seqnames = data$V1,
+    ranges = IRanges(start = data$V2, end = data$V3),
+    strand = "*"
+  )
+  
+  return(granges)
+}
+
+p300_peaks <- load_bed_gz("peaks/p300.bed.gz")
+h3k4me3_peaks <- load_bed_gz("peaks/H3K4me3.bed.gz")
+h3k4me1_peaks <- load_bed_gz("peaks/H3K4me1.bed.gz")
+h3k27ac_peaks <- load_bed_gz("peaks/H3K27ac.bed.gz")
+h3k27me3_peaks <- load_bed_gz("peaks/H3K27me3.bed.gz")
+
+print(p300_peaks)
+print(h3k4me3_peaks)
+print(h3k4me1_peaks)
+print(h3k27ac_peaks)
+print(h3k27me3_peaks)
+```
+
+
+```{r}
+overlaps_h3k4me3 <- findOverlaps(p300_peaks, h3k4me3_peaks)
+proportion_h3k4me3 <- length(unique(queryHits(overlaps_h3k4me3))) / length(p300_peaks)
+
+overlaps_h3k4me1 <- findOverlaps(p300_peaks, h3k4me1_peaks)
+proportion_h3k4me1 <- length(unique(queryHits(overlaps_h3k4me1))) / length(p300_peaks)
+
+overlaps_h3k27ac <- findOverlaps(p300_peaks, h3k27ac_peaks)
+proportion_h3k27ac <- length(unique(queryHits(overlaps_h3k27ac))) / length(p300_peaks)
+
+overlaps_h3k27me3 <- findOverlaps(p300_peaks, h3k27me3_peaks)
+proportion_h3k27me3 <- length(unique(queryHits(overlaps_h3k27me3))) / length(p300_peaks)
+
+print(paste("Proportion of p300 peaks overlapping H3K4me3:", round(proportion_h3k4me3 * 100, 2), "%"))
+print(paste("Proportion of p300 peaks overlapping H3K4me1:", round(proportion_h3k4me1 * 100, 2), "%"))
+print(paste("Proportion of p300 peaks overlapping H3K27ac:", round(proportion_h3k27ac * 100, 2), "%"))
+print(paste("Proportion of p300 peaks overlapping H3K27me3:", round(proportion_h3k27me3 * 100, 2), "%"))
+```
