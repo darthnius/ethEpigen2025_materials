@@ -1,0 +1,132 @@
+---
+title: "assignment"
+author: "Nils Schlatter"
+date: "2025-03-23"
+output: html_document
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(AnnotationHub)
+  library(ensembldb)
+  library(GenomicRanges)
+  library(epiwraps)
+  library(Rsubread)
+  library(rtracklayer)
+  library(Biostrings)
+  library(Rfastp)
+  library(ChIPseeker)
+  library(TxDb.Mmusculus.UCSC.mm10.knownGene)
+})
+```
+```{r}
+options(timeout = 3600)
+
+dir.create("peaks")
+
+download.file(
+  url = "https://www.encodeproject.org/files/ENCFF680CYO/@@download/ENCFF680CYO.bed.gz",
+  destfile = "peaks/mesc-h3k4me3.bed.gz",
+  mode = "wb"
+)
+
+download.file(
+  url = "https://www.encodeproject.org/files/ENCFF266LHB/@@download/ENCFF266LHB.bed.gz",
+  destfile = "peaks/mesc-h3k27me3.bed.gz",
+  mode = "wb"
+)
+
+download.file(
+  url = "https://www.encodeproject.org/files/ENCFF684IRJ/@@download/ENCFF684IRJ.bed.gz",
+  destfile = "peaks/mel-h3k27me3.bed.gz",
+  mode = "wb"
+)
+
+download.file(
+  url = "https://www.encodeproject.org/files/ENCFF339CXH/@@download/ENCFF339CXH.bed.gz",
+  destfile = "peaks/mel-h3k4me3.bed.gz",
+  mode = "wb"
+)
+
+```
+
+```{r}
+load_bed_gz <- function(file_path) {
+  con <- gzfile(file_path, open = "r")
+  
+  data <- read.table(con, sep = "\t", header = FALSE, stringsAsFactors = FALSE)
+  
+  close(con)
+  
+  granges <- GRanges(
+    seqnames = data$V1,
+    ranges = IRanges(start = data$V2, end = data$V3),
+    strand = "*"
+  )
+  
+  return(granges)
+}
+
+mesch3k4me3_peaks <- load_bed_gz("peaks/mesc-h3k4me3.bed.gz")
+mesch3k27me3_peaks <- load_bed_gz("peaks/mesc-h3k27me3.bed.gz")
+melh3k27me3_peaks <- load_bed_gz("peaks/mel-h3k27me3.bed.gz")
+melh3k4me3_peaks <- load_bed_gz("peaks/mel-h3k4me3.bed.gz")
+
+print(mesch3k4me3_peaks)
+print(mesch3k27me3_peaks)
+print(melh3k27me3_peaks)
+print(melh3k4me3_peaks)
+```
+
+
+```{r}
+mesc_overlaps <- findOverlaps(mesch3k27me3_peaks, mesch3k4me3_peaks)
+mel_overlaps <- findOverlaps(melh3k27me3_peaks, melh3k4me3_peaks)
+
+
+mesc_bivalent_domains <- pintersect(mesch3k27me3_peaks[queryHits(mesc_overlaps)], mesch3k4me3_peaks[subjectHits(mesc_overlaps)])
+mel_bivalent_domains <- pintersect(melh3k27me3_peaks[queryHits(mel_overlaps)], melh3k4me3_peaks[subjectHits(mel_overlaps)])
+
+mesc_bivalent_domains <- reduce(mesc_bivalent_domains)
+mel_bivalent_domains <- reduce(mel_bivalent_domains)
+
+overlaps_mesc_bivalent_h3k27me3 <- findOverlaps(mesc_bivalent_domains, melh3k27me3_peaks)
+
+overlaps_mesc_bivalent_h3k4me3 <- findOverlaps(mesc_bivalent_domains, melh3k4me3_peaks)
+
+overlaps_mesc_bivalent_both <- findOverlaps(mesc_bivalent_domains, intersect(melh3k27me3_peaks, melh3k4me3_peaks))
+```
+
+
+```{r}
+mesc_bivalent_annotated <- annotatePeak(mesc_bivalent_domains, tssRegion = c(-3000, 3000), TxDb = TxDb.Mmusculus.UCSC.mm10.knownGene)
+mel_bivalent_annotated <- annotatePeak(mel_bivalent_domains, tssRegion = c(-3000, 3000), TxDb = TxDb.Mmusculus.UCSC.mm10.knownGene)
+
+head(as.data.frame(mesc_bivalent_annotated))
+head(as.data.frame(mel_bivalent_annotated))
+
+write.table(as.data.frame(mesc_bivalent_annotated), file = "mesc_bivalent_annotated.txt", sep = "\t", quote = FALSE, row.names = FALSE)
+write.table(as.data.frame(mel_bivalent_annotated), file = "mel_bivalent_annotated.txt", sep = "\t", quote = FALSE, row.names = FALSE)
+```
+```{r}
+plotAnnoBar(mesc_bivalent_annotated)
+plotAnnoBar(mel_bivalent_annotated)
+
+plotDistToTSS(mesc_bivalent_annotated)
+plotDistToTSS(mel_bivalent_annotated)
+```
+
+```{r}
+num_overlap_h3k27me3 <- length(unique(queryHits(overlaps_mesc_bivalent_h3k27me3)))
+
+num_overlap_h3k4me3 <- length(unique(queryHits(overlaps_mesc_bivalent_h3k4me3)))
+
+num_overlap_both <- length(unique(queryHits(overlaps_mesc_bivalent_both)))
+
+total_mesc_bivalent <- length(mesc_bivalent_domains)
+
+cat("Total mouse ESC bivalent domains:", total_mesc_bivalent, "\n")
+cat("Overlapping H3K27me3 in  mouse Erythroblast:", num_overlap_h3k27me3, "\n")
+cat("Overlapping H3K4me3 in  mouse Erythroblast:", num_overlap_h3k4me3, "\n")
+cat("Overlapping both H3K27me3 and H3K4me3 in mouse Erythroblast:", num_overlap_both, "\n")
+```
