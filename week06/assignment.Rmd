@@ -1,0 +1,136 @@
+```{r}
+suppressPackageStartupMessages({
+  library(AnnotationHub)
+  library(GenomicRanges)
+  library(ggplot2)
+  library(motifmatchr)
+  library(Biostrings)
+  library(MotifDb)
+  library(TFBSTools)
+  library(universalmotif) 
+  library(PWMEnrich)
+  library(Rsamtools)
+  library(rtracklayer)
+  library(gridExtra)
+})
+```
+
+```{r}
+options(timeout = 3600)
+dir.create("peaks", showWarnings = FALSE)
+download.file(
+  url = "https://www.encodeproject.org/files/ENCFF219OVU/@@download/ENCFF219OVU.bed.gz",
+  destfile = "peaks/gata1.bed.gz",
+  mode = "wb"
+)
+```
+
+```{r}
+peaks <- rtracklayer::import("peaks/gata1.bed.gz", format="NarrowPeak")
+seqlevelsStyle(peaks) <- "Ensembl"
+peaks_chr1 <- peaks[seqnames(peaks)=="1"]
+print(paste("Number of peaks on chromosome 1:", length(peaks_chr1)))
+```
+
+```{r}
+ah <- AnnotationHub()
+genome <- ah[["AH14006"]]
+genome_seqs <- import(genome)
+motifs <- MotifDb[grep("GATA1", names(MotifDb))]
+names(motifs)
+motif <- motifs[[3]] 
+head(motif)
+```
+
+```{r}
+Biostrings::writeXStringSet(genome_seqs, filepath = "genome.fa")
+indexFa("genome.fa")
+print(names(genome_seqs))
+motif2 <- convert_motifs(motif, class="TFBSTools-PWMatrix")
+seqlevelsStyle(peaks_chr1) <- seqlevelsStyle(genome_seqs)
+moi <- motifmatchr::matchMotifs(motif2, subject=peaks_chr1, genome=Rsamtools::FaFile("genome.fa"),
+                                out="positions")
+moi <- moi[[1]]
+head(moi)
+```
+
+
+```{r}
+peaks_with_motif <- sum(lengths(moi) > 0)
+total_peaks <- length(peaks_chr1)
+proportion_peaks_with_motif <- peaks_with_motif / total_peaks * 100
+
+q1_data <- data.frame(
+  category = c("Peaks with GATA1 motif", "Peaks without GATA1 motif"),
+  count = c(peaks_with_motif, total_peaks - peaks_with_motif),
+  percentage = c(proportion_peaks_with_motif, 100 - proportion_peaks_with_motif)
+)
+
+q1_data$label <- paste0(q1_data$category, "\n", 
+                       format(q1_data$percentage, digits=1, nsmall=1), "%")
+
+q1_plot <- ggplot(q1_data, aes(x="", y=count, fill=category)) +
+  geom_bar(stat="identity", width=1) +
+  coord_polar("y", start=0) +
+  geom_text(aes(label=label), position=position_stack(vjust=0.5)) +
+  labs(title="Question 1: What percentage of GATA1 peaks contain a GATA1 motif?",
+       x=NULL, y=NULL, fill="Category") +
+  theme_minimal() +
+  theme(axis.text=element_blank(),
+        axis.ticks=element_blank(),
+        panel.grid=element_blank(),
+        plot.title=element_text(hjust=0.5, size=14)) +
+  scale_fill_manual(values=c("#4285F4", "#FBBC05"))
+
+cat(sprintf("Question 1: Of the %d peaks, %d (%.2f%%) contain a GATA1 motif\n", 
+            total_peaks, peaks_with_motif, proportion_peaks_with_motif))
+```
+
+```{r}
+seqlevelsStyle(genome_seqs) <- "UCSC" 
+
+genome_fa <- Rsamtools::FaFile("genome.fa")
+
+chr1_range <- GRanges(seqnames="chr1", 
+                     ranges=IRanges(1, seqlengths(genome_seqs)["chr1"]))
+
+all_motif_matches <- motifmatchr::matchMotifs(motif2, subject=chr1_range, 
+                                            genome=genome_fa, out="positions")
+all_motif_matches <- all_motif_matches[[1]]
+seqlevelsStyle(peaks_chr1) <- "UCSC"
+
+total_motif_instances <- length(all_motif_matches)
+
+overlapping_instances <- sum(countOverlaps(all_motif_matches, peaks_chr1) > 0)
+
+proportion_overlapping <- (overlapping_instances / total_motif_instances) * 100
+
+
+q2_data <- data.frame(
+  category = c("Motif instances overlapping peaks", "Motif instances not overlapping peaks"),
+  count = c(overlapping_instances, total_motif_instances - overlapping_instances),
+  percentage = c(proportion_overlapping, 100 - proportion_overlapping)
+)
+
+q2_data$label <- paste0(q2_data$category, "\n", 
+                       format(q2_data$percentage, digits=1, nsmall=1), "%")
+
+q2_plot <- ggplot(q2_data, aes(x="", y=count, fill=category)) +
+  geom_bar(stat="identity", width=1) +
+  coord_polar("y", start=0) +
+  geom_text(aes(label=label), position=position_stack(vjust=0.5)) +
+  labs(title="Question 2: What percentage of GATA1 motif instances overlap with peaks?",
+       x=NULL, y=NULL, fill="Category") +
+  theme_minimal() +
+  theme(axis.text=element_blank(),
+        axis.ticks=element_blank(),
+        panel.grid=element_blank(),
+        plot.title=element_text(hjust=0.5, size=14)) +
+  scale_fill_manual(values=c("#34A853", "#EA4335"))
+
+cat(sprintf("Question 2: Of the %d motif instances, %d (%.2f%%) overlap a peak\n",
+            total_motif_instances, overlapping_instances, proportion_overlapping))
+
+print(grid.arrange(q1_plot, q2_plot, ncol=2))
+```
+
