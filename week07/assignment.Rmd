@@ -1,0 +1,113 @@
+---
+title: "assignment"
+author: "Nils Schlatter"
+date: "2025-04-06"
+output: html_document
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(epiwraps)
+  library(AnnotationHub)
+  library(BSgenome.Mmusculus.UCSC.mm10)
+  library(MotifDb)
+  library(universalmotif)
+  library(ensembldb)
+  library(ggplot2)
+  library(gridExtra)
+})
+```
+```{r}
+ah <- AnnotationHub(localHub=TRUE)
+genome <- BSgenome.Mmusculus.UCSC.mm10
+chr19 <- genome[["chr19"]]
+
+download.file("https://ethz-ins.org/content/w7/atac.chr19.bam", "atac.chr19.bam", mode="wb")
+download.file("https://ethz-ins.org/content/w7/atac.chr19.bam.bai", "atac.chr19.bam.bai", mode="wb")
+  
+epiwraps::bam2bw("atac.chr19.bam", output_bw = "NF_cuts.bw", paired=TRUE, 
+                  binWidth=1L, type="ends", minFragLength=30, 
+                  maxFragLength=120, trim=4L, extend=3L, forceSeqlevelsStyle = "Ensembl")
+  
+epiwraps::bam2bw("atac.chr19.bam", output_bw = "mono_centers.bw", paired=TRUE, 
+                  binWidth=5L, minFragLength=140, trim=4L,
+                  maxFragLength=220, type="center", extend=10L, forceSeqlevelsStyle = "Ensembl")
+
+tracks <- list.files(pattern="\\.bw$") 
+names(tracks) <- gsub("\\.bw$", "", tracks)
+
+print(tracks)
+
+klf4_motifs <- MotifDb::query(MotifDb, c("KLF4", "Mus"))
+maz_motifs <- MotifDb::query(MotifDb, c("MAZ", "Mus"))
+
+klf4_motif <- klf4_motifs[[1]]
+maz_motif <- maz_motifs[[1]]
+
+klf4_motif2 <- convert_motifs(klf4_motif, class="TFBSTools-PFMatrix")
+maz_motif2 <- convert_motifs(maz_motif, class="TFBSTools-PFMatrix")
+```
+
+```{r}
+klf4_matches <- motifmatchr::matchMotifs(klf4_motif2, chr19, out="positions", p.cutoff=1e-5)[[1]]
+
+klf4_ir <- unlist(klf4_matches)
+mcols(klf4_ir) <- NULL
+klf4_sites <- GRanges(seqnames = "19", ranges = klf4_ir, strand = "*")
+
+maz_matches <- motifmatchr::matchMotifs(maz_motif2, chr19, out="positions", p.cutoff=1e-5)[[1]]
+
+maz_ir <- unlist(maz_matches)
+mcols(maz_ir) <- NULL
+maz_sites <- GRanges(seqnames = "19", ranges = maz_ir, strand = "*")
+
+print(paste("KLF4 binding sites found:", length(klf4_sites)))
+print(paste("MAZ binding sites found:", length(maz_sites)))
+```
+
+
+```{r}
+current_dir <- getwd()
+selected_tracks <- c(
+  "NF_cuts" = file.path(current_dir, "NF_cuts.bw"),
+  "mono_centers" = file.path(current_dir, "mono_centers.bw")
+)
+
+klf4_signals <- signal2Matrix(selected_tracks, klf4_sites, w=5, extend=300)
+maz_signals <- signal2Matrix(selected_tracks, maz_sites, w=5, extend=300)
+```
+
+```{r, fig.width=10, fig.height=6}
+create_factor_plot <- function(signal_matrix, factor_name) {
+  melted_data <- meltSignals(signal_matrix)
+  
+  p <- ggplot(melted_data, aes(position, mean, color=sample)) +
+    geom_line(size=1.2) +
+    theme_minimal() +
+    labs(
+      title = paste("ATAC-seq Signal around", factor_name, "Motifs"),
+      x = "Distance from Motif Center (bp)",
+      y = "Signal Intensity",
+      color = "Track"
+    ) +
+    scale_color_manual(
+      values = c("NF_cuts" = "darkblue", "mono_centers" = "darkred"),
+      labels = c("NF_cuts" = "Nucleosome-free Insertions", "mono_centers" = "Nucleosome Centers")
+    ) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      legend.position = "bottom"
+    )
+  
+  return(p)
+}
+
+
+klf4_plot <- create_factor_plot(klf4_signals, "KLF4")
+maz_plot <- create_factor_plot(maz_signals, "MAZ")
+print(klf4_plot)
+print(maz_plot)
+```
+
+
+```
