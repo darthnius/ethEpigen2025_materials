@@ -1,0 +1,357 @@
+---
+title: "assignment"
+author: "Nils Schlatter"
+date: "2025-04-14"
+output: html_document
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(epiwraps)
+  library(motifmatchr)
+  library(MotifDb)
+  library(universalmotif)
+  library(ggplot2)
+  library(SummarizedExperiment)
+  library(sechm)
+  library(BiocParallel)
+  library(chromVAR)
+  library(limma)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(dplyr)
+  library(BiocParallel)
+  library(BSgenome.Mmusculus.UCSC.mm10)
+  library(ggrepel)
+})
+```
+```{r}
+register(SnowParam(workers = 8))
+
+options(timeout = 6000)
+download.file("https://ethz-ins.org/content/mouse_mm38_hippocampus.peakCounts.SE.rds", 
+              "mouse_hippocampus.rds", 
+              mode = "wb")
+
+se <- readRDS("mouse_hippocampus.rds")
+colData(se)$condition <- ifelse(grepl("^Control", colnames(se)), "CTRL", 
+                               ifelse(grepl("^FSS", colnames(se)), "FSS", NA))
+colData(se)$sex <- ifelse(grepl("_male", colnames(se), ignore.case = TRUE), "M", 
+                         ifelse(grepl("female", colnames(se), ignore.case = TRUE), "F", NA))
+print(se)
+
+print(colData(se))
+```
+
+```{r}
+motifs <- query(MotifDb, c("JASPAR2022", "Mmusculus"))
+
+motifs <- do.call(TFBSTools::PWMatrixList, setNames(
+  universalmotif::convert_motifs(motifs, class = "TFBSTools-PWMatrix"),
+  mcols(motifs)$geneSymbol))
+print(motifs)
+
+current_seqnames <- unique(as.character(seqnames(rowRanges(se))))
+print(current_seqnames)
+bsg_seqnames <- seqnames(BSgenome.Mmusculus.UCSC.mm10)
+print(bsg_seqnames)
+
+standardize_chr_names <- function(se, genome) {
+  current <- unique(as.character(seqnames(rowRanges(se))))
+  target <- seqnames(genome)
+  
+  if(any(grepl("^chr", current)) && !any(grepl("^chr", target))) {
+    seqlevels(se) <- gsub("^chr", "", seqlevels(se))
+  } else if(!any(grepl("^chr", current)) && any(grepl("^chr", target))) {
+    new_levels <- paste0("chr", seqlevels(se))
+    seqlevels(se) <- new_levels
+  }
+  common_seqlevels <- intersect(seqlevels(se), seqnames(genome))
+  se <- keepSeqlevels(se, common_seqlevels, pruning.mode="coarse")
+  
+  return(se)
+}
+
+se_updated <- standardize_chr_names(se, BSgenome.Mmusculus.UCSC.mm10)
+
+se <- chromVAR::addGCBias(se_updated, genome = BSgenome.Mmusculus.UCSC.mm10)
+
+hist(rowData(se)$bias, main = "GC Bias Distribution", xlab = "GC Bias")
+
+
+assay(se) <- as.matrix(assay(se))
+
+keep_peaks <- rowSums(assay(se) >= 5) >= 3
+se_filtered <- se[keep_peaks, ]
+
+print(paste("Original peaks:", nrow(se)))
+print(paste("Filtered peaks:", nrow(se_filtered)))
+
+moi <- motifmatchr::matchMotifs(motifs, subject = se_filtered, genome = BSgenome.Mmusculus.UCSC.mm10)
+print(moi)
+
+my_getBackgroundPeaks <- function(se, niterations = 200) {
+  counts_matrix <- as.matrix(assay(se))
+  
+  gc_bias <- rowData(se)$bias
+  accessibility <- rowMeans(counts_matrix)
+  
+  gc_bins <- cut(gc_bias, breaks = 10)
+  acc_bins <- cut(accessibility, breaks = 10)
+  combined_bins <- paste0(gc_bins, "_", acc_bins)
+  unique_bins <- unique(combined_bins)
+  
+  bg_peaks <- list()
+  all_indices <- 1:nrow(se)
+  peak_names <- rownames(se)
+  
+  for(i in 1:niterations) {
+    bg_indices <- integer(0)
+  
+    for(bin in unique_bins) {
+      bin_indices <- which(combined_bins == bin)
+      if(length(bin_indices) > 1) {
+        n_sample <- length(bin_indices)
+        bg_indices <- c(bg_indices, sample(bin_indices, n_sample, replace = TRUE))
+      } else if(length(bin_indices) == 1) {
+        bg_indices <- c(bg_indices, bin_indices)
+      }
+    }
+    
+    bg_peaks[[i]] <- bg_indices
+  }
+  
+  bg_object <- list(
+    bgPeaks = bg_peaks,
+    peaks = peak_names
+  )
+  class(bg_object) <- "backgroundPeaks"
+  
+  return(bg_object)
+}
+
+set.seed(12345)
+bg <- my_getBackgroundPeaks(se_filtered, niterations = 200)
+
+my_computeDeviations <- function(object, annotations, background_peaks) {
+  counts_matrix <- as.matrix(assay(object))
+  
+  annot_matrix <- as.matrix(assay(annotations))
+  
+  n_annots <- ncol(annot_matrix)
+  n_samples <- ncol(counts_matrix)
+  
+  deviation_scores <- matrix(0, nrow=n_annots, ncol=n_samples)
+  z_scores <- matrix(0, nrow=n_annots, ncol=n_samples)
+  
+  rownames(deviation_scores) <- colnames(annot_matrix)
+  colnames(deviation_scores) <- colnames(counts_matrix)
+  rownames(z_scores) <- colnames(annot_matrix)
+  colnames(z_scores) <- colnames(counts_matrix)
+  
+  sample_totals <- colSums(counts_matrix)
+  
+  for(i in 1:n_annots) {
+    motif_peaks <- which(annot_matrix[,i] == 1)
+    
+    for(j in 1:n_samples) {
+      observed <- sum(counts_matrix[motif_peaks, j]) / sample_totals[j]
+      
+      expected_values <- numeric(length(background_peaks$bgPeaks))
+      
+      for(b in 1:length(background_peaks$bgPeaks)) {
+        bg_indices <- background_peaks$bgPeaks[[b]]
+        matched_bg <- bg_indices[1:min(length(bg_indices), length(motif_peaks))]
+        if(length(matched_bg) > 0) {
+          expected_values[b] <- sum(counts_matrix[matched_bg, j]) / sample_totals[j]
+        } else {
+          expected_values[b] <- NA
+        }
+      }
+      
+      expected_values <- expected_values[!is.na(expected_values)]
+      
+      if(length(expected_values) > 0) {
+        expected_mean <- mean(expected_values)
+        expected_sd <- sd(expected_values)
+        
+        if(expected_sd > 0) {
+          deviation <- observed - expected_mean
+          z <- deviation / expected_sd
+          
+          deviation_scores[i, j] <- deviation
+          z_scores[i, j] <- z
+        }
+      }
+    }
+    
+    if(i %% 10 == 0) {
+      cat("Processed", i, "of", n_annots, "annotations\n")
+    }
+  }
+  
+  result <- SummarizedExperiment(
+    assays = list(
+      deviations = deviation_scores,
+      z = z_scores
+    ),
+    colData = colData(object),
+    rowData = DataFrame(name = colnames(annot_matrix))
+  )
+  
+  return(result)
+}
+
+dev <- my_computeDeviations(object = se_filtered, 
+                               annotations = moi,
+                               background_peaks = bg)
+print(dev)
+saveRDS(dev, "chromVAR_deviations.rds")
+
+```
+
+
+```{r}
+print(dev)
+print(colData(dev))
+
+colData(dev)$condition <- factor(colData(dev)$condition)
+colData(dev)$condition <- relevel(colData(dev)$condition, ref = "CTRL")
+
+motif_of_interest <- rownames(dev)[1]
+deviation_scores <- assays(dev)$deviations[motif_of_interest, ]
+plot(deviation_scores ~ colData(dev)$condition, 
+     main=paste("Deviation scores for", motif_of_interest),
+     xlab="Condition", ylab="Deviation score")
+
+var_motifs <- order(rowVars(assays(dev)$z), decreasing=TRUE)[1:20]
+pheatmap(assays(dev)$z[var_motifs,], 
+         annotation_col=as.data.frame(colData(dev)[,c("sex","condition")]),
+         main="Top variable motifs")
+
+mm_stress <- model.matrix(~condition, data = as.data.frame(colData(dev)))
+print(mm_stress)
+
+fit_stress <- limma::eBayes(limma::lmFit(object = assays(dev)$z, design = mm_stress))
+res_stress <- as.data.frame(limma::topTable(fit_stress, coef = "conditionFSS", number = Inf))
+
+if(is.numeric(as.numeric(rownames(res_stress)))) {
+  res_stress$TF <- rownames(dev)[as.numeric(rownames(res_stress))]
+} else {
+  res_stress$TF <- rownames(res_stress)
+}
+
+
+cat("\nTop motifs differential in Stress vs Control:\n")
+print(head(res_stress[order(res_stress$adj.P.Val), c("TF", "logFC", "P.Value", "adj.P.Val")], 10))
+
+p1 <- ggplot(res_stress, aes(x = logFC, y = -log10(adj.P.Val))) +
+  geom_point(aes(color = adj.P.Val < 0.05), size = 1) +
+  scale_color_manual(values = c("grey", "red")) +
+  geom_text_repel(data = subset(res_stress, adj.P.Val < 0.05), 
+                 aes(label = TF), size = 3, max.overlaps = 15) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Differential Motif Accessibility: Stress vs Control",
+       x = "Log2 Fold Change", y = "-log10(adjusted p-value)") +
+  theme(legend.position = "none")
+print(p1)
+ggsave("volcano_stress_vs_control.png", p1, width = 8, height = 6)
+
+top_stress_TFs <- head(res_stress[order(res_stress$adj.P.Val), "TF"], 15)
+print(top_stress_TFs) 
+anno_colors <- list(
+  condition = c(CTRL = "lightblue", FSS = "darkred"),
+  sex = c(M = "skyblue", F = "pink")
+)
+
+mat <- assays(dev)$z[top_stress_TFs, ]
+anno_col <- data.frame(
+  condition = colData(dev)$condition,
+  sex = colData(dev)$sex
+)
+rownames(anno_col) <- colnames(dev)
+
+pheatmap(assays(dev)$z[top_stress_TFs, ], 
+         annotation_col = anno_col,
+         annotation_colors = list(
+           condition = c(CTRL = "lightblue", FSS = "darkred"),
+           sex = c(M = "skyblue", F = "pink")
+         ),
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         fontsize_row = 8,
+         cellheight = 12,
+         main = "Top Differential Motifs - Stress vs Control")
+
+print("The data does not suggests that there is a link between the condition of the mouse and motif accessibility due to no significance on the volcano plot. However, according to the TF heatmap there might be significant difference. Additionally, there seems to be two different groups in FSS mice (responder and  non-responder) according to the TF heatmap. The fact that in the volcano plot there is no significance might be due to this.")
+```
+
+```{r}
+
+dev$sex_factor <- factor(dev$sex)
+dev$sex_factor <- relevel(dev$sex_factor, ref = "F")
+
+mm_sex <- model.matrix(~sex_factor + condition, data = as.data.frame(colData(dev)))
+print(mm_sex)
+
+fit_sex <- limma::eBayes(limma::lmFit(object = assays(dev)$z, design = mm_sex))
+res_sex <- as.data.frame(limma::topTable(fit_sex, coef = "sex_factorM", number = Inf))
+res_sex$TF <- rownames(res_sex)
+
+cat("\nTop motifs differential between Male and Female:\n")
+print(head(res_sex[order(res_sex$adj.P.Val), c("TF", "logFC", "P.Value", "adj.P.Val")], 10))
+
+p2 <- ggplot(res_sex, aes(x = logFC, y = -log10(adj.P.Val))) +
+  geom_point(aes(color = adj.P.Val < 0.05), size = 1) +
+  scale_color_manual(values = c("grey", "purple")) +
+  geom_text_repel(data = subset(res_sex, adj.P.Val < 0.05), 
+                 aes(label = TF), size = 3, max.overlaps = 15) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  theme_minimal() +
+  labs(title = "Differential Motif Accessibility: Male vs Female",
+       x = "Log2 Fold Change", y = "-log10(adjusted p-value)") +
+  theme(legend.position = "none")
+print(p2)
+ggsave("volcano_male_vs_female.png", p2, width = 8, height = 6)
+
+top_sex_TFs <- head(res_sex[order(res_sex$adj.P.Val), "TF"], 15)
+
+anno_col_sex <- data.frame(
+  sex = colData(dev)$sex_factor,
+  condition = colData(dev)$condition
+)
+rownames(anno_col_sex) <- colnames(dev)
+
+top_indices <- head(order(res_sex$adj.P.Val), 15)
+
+top_sex_TFs_direct <- rownames(dev)[top_indices]
+
+pheatmap(assays(dev)$z[top_sex_TFs_direct, ], 
+         annotation_col = anno_col_sex,
+         annotation_colors = list(
+           sex = c(F = "pink", M = "skyblue"),
+           condition = c(CTRL = "lightblue", FSS = "darkred")
+         ),
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         fontsize_row = 8,  
+         cellheight = 12, 
+         main = "Top Differential Motifs - Male vs Female",
+         color = colorRampPalette(rev(brewer.pal(11, "RdBu")))(100))
+
+combined_results <- merge(res_stress, res_sex, by = "TF", suffixes = c(".stress", ".sex"))
+combined_results$sig_stress <- combined_results$adj.P.Val.stress < 0.05
+combined_results$sig_sex <- combined_results$adj.P.Val.sex < 0.05
+combined_results$sig_both <- combined_results$sig_stress & combined_results$sig_sex
+
+cat("\nMotifs significantly differential in both stress and sex comparisons:\n")
+print(combined_results[combined_results$sig_both, c("TF", "logFC.stress", "adj.P.Val.stress", 
+                                                  "logFC.sex", "adj.P.Val.sex")])
+
+write.csv(res_stress, "differential_motifs_stress_vs_control.csv", row.names = FALSE)
+write.csv(res_sex, "differential_motifs_male_vs_female.csv", row.names = FALSE)
+write.csv(combined_results, "combined_differential_motifs.csv", row.names = FALSE)
+
+print("There does not seem to be a difference between sexes observed in motif accessibility in this data (No significance in the volcano plot). The TF hesatmap also does not suggest a differnce between sexes.")
+```
