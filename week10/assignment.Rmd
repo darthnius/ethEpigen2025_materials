@@ -1,0 +1,159 @@
+---
+title: "Assignment 10"
+output: html_document
+date: "2025-05-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+
+```{r}
+suppressPackageStartupMessages({
+  library(GenomicRanges)
+  library(epiwraps)
+  library(ggplot2)
+  library(rGREAT)
+  library(rtracklayer)
+  library(viridis)
+})
+```
+
+
+
+```{r}
+options(timeout = 6000)
+download.file("https://ethz-ins.org/content/w10.assignment.zip", "w10.assignment.zip")
+unzip("w10.assignment.zip")
+list.files()
+```
+
+
+```{r}
+peaks_files <- list.files(pattern="bed$")
+tracks_files <- list.files(pattern="bw$")
+
+print(peaks_files)
+print(tracks_files)
+```
+
+
+```{r}
+peaks <- lapply(peaks_files, rtracklayer::import.bed)
+names(peaks) <- gsub("\\..*", "", peaks_files)
+
+lapply(peaks, head)
+
+peaks_filtered <- lapply(peaks, FUN=function(x) x[x$score > 800])
+
+peaks_counts <- data.frame(
+  Original = sapply(peaks, length),
+  Filtered = sapply(peaks_filtered, length)
+)
+print(peaks_counts)
+```
+
+
+```{r}
+regions <- reduce(unlist(GRangesList(peaks_filtered)))
+print(paste("Number of unique regions:", length(regions)))
+```
+
+
+```{r}
+ese <- signal2Matrix(tracks_files, regions, extend=2000)
+ese
+```
+
+
+```{r fig.height=8, fig.width=10}
+plotEnrichedHeatmaps(ese, colors=c("white", "darkred"))
+```
+
+
+```{r}
+set.seed(123)
+cl_range <- clusterSignalMatrices(ese, k=2:10)
+
+ggplot(cl_range$varExplained, aes(k, varExplained)) + 
+  geom_line() + 
+  geom_point() +
+  labs(title="Variance Explained by Number of Clusters",
+       x="Number of clusters",
+       y="Variance explained") +
+  theme_minimal()
+```
+
+
+```{r}
+k_optimal <- 5
+
+set.seed(123)
+cl <- clusterSignalMatrices(ese, k=k_optimal)
+
+rowData(ese)$cluster <- cl
+
+table(cl)
+```
+
+
+```{r fig.height=10, fig.width=12}
+mycolors <- c("1"="blue", "2"="red", "3"="green", "4"="purple","5"="yellow")
+
+plotEnrichedHeatmaps(ese, row_split="cluster", 
+                     mean_color=mycolors, 
+                     colors=c("white","darkred"))
+```
+
+
+```{r fig.height=8, fig.width=10}
+d <- meltSignals(ese, splitBy=cl)
+
+ggplot(d, aes(position, mean, colour=sample)) + 
+  geom_line(size=1.2) + 
+  facet_wrap(~split) +
+  labs(title="Average binding profiles by cluster",
+       x="Distance from center (bp)",
+       y="Mean signal") +
+  theme_bw()
+```
+
+
+```{r}
+split_regions <- split(rowRanges(ese), rowData(ese)$cluster)
+lengths(split_regions)
+
+
+target_cluster <- "3"
+
+res <- great(split_regions[[target_cluster]], gene_sets="GO:BP", 
+             tss_source="hg38", background=regions, cores=2)
+
+bp <- getEnrichmentTables(res)
+head(bp)
+```
+
+
+```{r fig.width=12, fig.height=8}
+ggplot(head(bp, 15), 
+       aes(fold_enrichment, reorder(description, p_adjust), 
+           size=observed_region_hits, color=-log10(p_adjust))) + 
+  geom_point() + 
+  scale_color_viridis_c() +
+  labs(title=paste("GO Biological Process Enrichment for Cluster", target_cluster),
+       x="Fold Enrichment",
+       y="GO Term",
+       size="Number of Regions",
+       color="-log10(adjusted p-value)") +
+  theme_bw() +
+  theme(axis.text.y = element_text(size=10))
+```
+
+```{r}
+print("Analysis of the three CREB family transcription factors reveals distinct binding patterns across the genome. Through clustering analysis identified 5 major binding clusters. In Cluster 3 binding to Creb3 is shown to be higher than the other factors. Other clusters display differential binding preferences, with some factors showing stronger affinity to certain genomic regions than others. Gene Ontology enrichment analysis of Cluster 3 reveals significant association with cell communication and cellular response to stimuli. This suggests that co-binding of these factors may be particularly important for regulating cell communication and cellular response to stimuli.
+
+The differing binding patterns observed in other clusters suggest that these transcription factors, despite belonging to the same family, have unique roles in gene regulation. Cluster 3 is particularly interesting as it shows strong binding of Creb3 with minimal binding of the other factors, suggesting factor-specific regulatory functions.")
+```
+
+
