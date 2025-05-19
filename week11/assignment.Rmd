@@ -1,0 +1,99 @@
+---
+title: "Assignment"
+output: html_document
+date: "2025-05-19"
+---                                                                                           
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+
+```{r}
+suppressPackageStartupMessages({
+  library(epiwraps)
+  library(ggplot2)
+  library(pheatmap)
+  library(rtracklayer)
+  library(GenomicRanges)
+  library(bsseq)
+  library(rGREAT)
+  library(viridis)
+  library(BiocParallel)
+  library(AnnotationHub)
+})
+```
+
+
+
+```{r load_data}
+options(timeout = 6000)
+
+dmr_url <- "https://github.com/ETHZ-INS/ethEpigen2025_materials/raw/main/week11/dmr.rds"
+download.file(dmr_url, "dmr.rds")
+
+download.file("https://ethz-ins.org/content/w11_practical.zip", "w11_practical.zip")
+unzip("w11_practical.zip")
+
+dmrRanges <- readRDS("dmr.rds")
+
+bs <- readRDS("ESC_astrocytes_BSseq.rds")
+
+bs <- bs[rowSums(assay(bs,"Cov")>0)==ncol(bs),]
+
+bs <- BSmooth(bs, BPPARAM=MulticoreParam(4, progress=TRUE))
+
+bs
+head(dmrRanges)
+```
+
+
+```{r heatmap_getmeth}
+top_dmrs <- dmrRanges[order(abs(dmrRanges$meandiff), decreasing=TRUE)][1:5]
+print(top_dmrs)
+
+meth_vals <- bsseq::getMeth(bs, regions=top_dmrs, what="perRegion")
+rownames(meth_vals) <- paste0("DMR_", 1:5, " (", top_dmrs$chr, ":", 
+                             start(top_dmrs), "-", end(top_dmrs), ")")
+pheatmap(meth_vals, 
+         main="Methylation Levels in Top 5 DMRs",
+         color=viridis(100),
+         cluster_cols=FALSE,
+         cluster_rows=TRUE,
+         display_numbers=TRUE,
+         number_format="%.2f",
+         fontsize_number=10,
+         angle_col=45)
+```
+
+
+
+
+
+```{r great_analysis}
+bs_granges <- granges(bs)
+res <- great(dmrRanges, gene_sets="GO:BP", 
+             tss_source="hg19", background=bs_granges, cores=2)
+
+bp <- getEnrichmentTables(res)
+
+head(bp)
+```
+
+
+```{r great_visualization, fig.width=10, fig.height=6}
+ggplot(head(bp, 15), 
+       aes(fold_enrichment, reorder(description, p_adjust), 
+           size=observed_region_hits, color=-log10(p_adjust))) + 
+  geom_point() + 
+  scale_color_viridis_c() +
+  labs(title=paste("GO Biological Process Enrichment for Differentially Methylated Regions"),
+       x="Fold Enrichment",
+       y="GO Term",
+       size="Number of Regions",
+       color="-log10(adjusted p-value)") +
+  theme_bw() +
+  theme(axis.text.y = element_text(size=10))
+
+print("This figure shows the enrichment of the DMRs relative to the entire genome. In this case it shows significance for detoxification processes and similar categories.")
+```
