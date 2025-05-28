@@ -1,0 +1,258 @@
+---
+title: "Assignment 12"
+output: html_document
+date: "2025-05-26"
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(GenomicRanges)
+  library(AnnotationHub)
+  library(ensembldb)
+  library(rtracklayer)
+  library(ggplot2)
+  library(dplyr)
+  library(ChIPseeker)
+})
+```
+
+```{r}
+download.file("https://www.encodeproject.org/files/ENCFF843PIU/@@download/ENCFF843PIU.bed.gz", "atf4_peaks.bed.gz")
+atf4_peaks <- read.table("atf4_peaks.bed.gz", header = FALSE, sep = "\t")
+head(atf4_peaks)
+
+atf4_gr <- GRanges(
+  seqnames = atf4_peaks$V1,
+  ranges = IRanges(start = atf4_peaks$V2 + 1,
+                   end = atf4_peaks$V3),
+  strand = "*"
+)
+
+head(atf4_gr)
+```
+
+```{r}
+if (!file.exists("salviato_targets.rds")) {
+  download.file("https://ethz-ins.org/content/hg38.SalviatoDistalEnhancerTargets.GR.rds", 
+                "salviato_targets.rds")
+}
+
+salviato_interactions <- readRDS("salviato_targets.rds")
+seqlevelsStyle(salviato_interactions) <- "UCSC"
+
+cat("Total Salviato interactions:", length(salviato_interactions), "\n")
+head(salviato_interactions)
+```
+
+```{r}
+overlaps <- findOverlaps(atf4_gr, salviato_interactions)
+
+cat("ATF4 peaks overlapping with Salviato regions:", length(unique(from(overlaps))), "\n")
+cat("Total overlaps (some peaks may overlap multiple regions):", length(overlaps), "\n")
+
+atf4_with_targets <- atf4_gr[from(overlaps)]
+target_interactions <- salviato_interactions[to(overlaps)]
+
+mcols(atf4_with_targets)$target_genes <- target_interactions$target_genes
+mcols(atf4_with_targets)$interaction_id <- to(overlaps)
+
+cat("ATF4 peaks with predicted distal targets:", length(atf4_with_targets), "\n")
+head(atf4_with_targets)
+```
+
+```{r}
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(org.Hs.eg.db)
+
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+
+peak_anno <- annotatePeak(atf4_with_targets, 
+                         tssRegion = c(-3000, 3000),
+                         TxDb = txdb,
+                         annoDb = "org.Hs.eg.db")
+
+peak_df <- as.data.frame(peak_anno)
+
+target_genes_list <- salviato_interactions[to(overlaps)]$target
+
+target_genes_char <- sapply(target_genes_list, function(x) {
+  if(length(x) == 0) return(NA_character_)
+  paste(x, collapse = ",")
+})
+
+peak_df$predicted_targets <- target_genes_char
+
+cat("Columns in peak_df:", paste(colnames(peak_df), collapse = ", "), "\n")
+cat("Number of rows in peak_df:", nrow(peak_df), "\n")
+cat("Length of target_genes_list:", length(target_genes_list), "\n")
+
+available_cols <- intersect(c("seqnames", "start", "end", "annotation", "SYMBOL", "predicted_targets"), 
+                           colnames(peak_df))
+cat("Available columns for display:", paste(available_cols, collapse = ", "), "\n")
+
+head(peak_df[, available_cols])
+```
+
+```{r}
+peak_summary <- peak_df %>%
+  select(seqnames, start, end, width, annotation, SYMBOL, predicted_targets) %>%
+  mutate(
+    peak_id = paste0(seqnames, ":", start, "-", end),
+    annotation_simple = case_when(
+      grepl("Promoter", annotation) ~ "Promoter",
+      grepl("Intron", annotation) ~ "Intronic",
+      grepl("Exon", annotation) ~ "Exonic",
+      grepl("Downstream", annotation) ~ "Downstream",
+      grepl("Intergenic", annotation) ~ "Intergenic",
+      TRUE ~ "Other"
+    )
+  )
+
+head(peak_summary, 10)
+
+annotation_summary <- peak_summary %>%
+  group_by(annotation_simple) %>%
+  summarise(
+    total_peaks = n(),
+    peaks_with_targets = sum(!is.na(predicted_targets)),
+    .groups = 'drop'
+  ) %>%
+  mutate(percentage_with_targets = round(peaks_with_targets/total_peaks * 100, 1))
+
+print(annotation_summary)
+
+targets_detail <- peak_summary %>%
+  filter(!is.na(predicted_targets)) %>%
+  select(peak_id, annotation_simple, SYMBOL, predicted_targets) %>%
+  mutate(
+    local_gene = ifelse(is.na(SYMBOL), "No local gene", SYMBOL),
+    num_predicted_targets = lengths(strsplit(as.character(predicted_targets), ","))
+  )
+
+head(targets_detail, 10)
+
+cat("Summary of ATF4 peaks with 3D contact predictions:\n")
+cat("Total peaks analyzed:", nrow(peak_df), "\n")
+cat("Peaks with predicted distal targets:", sum(!is.na(peak_df$predicted_targets)), "\n")
+cat("Percentage with predicted targets:", 
+    round(sum(!is.na(peak_df$predicted_targets))/nrow(peak_df) * 100, 1), "%\n")
+```
+
+```{r}
+library(ggplot2)
+
+genes <- genes(TxDb.Hsapiens.UCSC.hg38.knownGene)
+gene_symbols <- AnnotationDbi::select(org.Hs.eg.db, keys=genes$gene_id, 
+                                     columns=c("SYMBOL"), keytype="ENTREZID")
+gene_symbols <- gene_symbols[!duplicated(gene_symbols$ENTREZID),]
+mcols(genes)$SYMBOL <- gene_symbols$SYMBOL[match(genes$gene_id, gene_symbols$ENTREZID)]
+
+nearest_genes <- distanceToNearest(atf4_with_targets, genes)
+nearest_distances <- mcols(nearest_genes)$distance
+nearest_gene_indices <- subjectHits(nearest_genes)
+nearest_gene_symbols <- mcols(genes)$SYMBOL[nearest_gene_indices]
+
+peak_target_analysis <- data.frame(
+  peak_id = paste0(seqnames(atf4_with_targets), ":", 
+                   start(atf4_with_targets), "-", end(atf4_with_targets)),
+  peak_center = start(atf4_with_targets) + width(atf4_with_targets)/2,
+  nearest_gene = nearest_gene_symbols,
+  nearest_distance = nearest_distances,
+  predicted_targets = target_genes_char,
+  stringsAsFactors = FALSE
+)
+
+peak_target_analysis <- peak_target_analysis[!is.na(peak_target_analysis$predicted_targets),]
+
+calculate_target_distances <- function(peak_center, predicted_targets, genes) {
+  if(is.na(predicted_targets)) return(list(distances = NA, directions = NA, genes = NA))
+  
+  target_list <- unlist(strsplit(predicted_targets, ","))
+  
+  matching_genes <- genes[!is.na(mcols(genes)$SYMBOL) & 
+                         mcols(genes)$SYMBOL %in% target_list]
+  
+  if(length(matching_genes) == 0) return(list(distances = NA, directions = NA, genes = NA))
+  
+  distances <- peak_center - start(matching_genes)
+  gene_symbols <- mcols(matching_genes)$SYMBOL
+  
+  directions <- ifelse(distances > 0, "Downstream", "Upstream")
+  
+  return(list(distances = distances, directions = directions, genes = gene_symbols))
+}
+
+peak_target_results <- mapply(calculate_target_distances,
+                             peak_target_analysis$peak_center,
+                             peak_target_analysis$predicted_targets,
+                             MoreArgs = list(genes = genes),
+                             SIMPLIFY = FALSE)
+
+expanded_analysis <- data.frame()
+
+for(i in seq_along(peak_target_results)) {
+  result <- peak_target_results[[i]]
+  if(!is.na(result$distances[1])) {
+    for(j in seq_along(result$distances)) {
+      row <- data.frame(
+        peak_id = peak_target_analysis$peak_id[i],
+        peak_center = peak_target_analysis$peak_center[i],
+        nearest_gene = peak_target_analysis$nearest_gene[i],
+        nearest_distance = peak_target_analysis$nearest_distance[i],
+        predicted_target = result$genes[j],
+        distance_to_target = result$distances[j],
+        direction = result$directions[j],
+        target_matches_nearest = peak_target_analysis$nearest_gene[i] == result$genes[j],
+        stringsAsFactors = FALSE
+      )
+      expanded_analysis <- rbind(expanded_analysis, row)
+    }
+  }
+}
+
+cat("Analysis Results:\n")
+cat("Total peak-target pairs:", nrow(expanded_analysis), "\n")
+
+upstream_peaks <- expanded_analysis[expanded_analysis$direction == "Upstream",]
+downstream_peaks <- expanded_analysis[expanded_analysis$direction == "Downstream",]
+
+cat("\nUpstream peaks:", nrow(upstream_peaks), "\n")
+if(nrow(upstream_peaks) > 0) {
+  upstream_match_prop <- mean(upstream_peaks$target_matches_nearest, na.rm = TRUE)
+  cat("Proportion where predicted target is closest gene:", round(upstream_match_prop * 100, 1), "%\n")
+}
+
+cat("\nDownstream peaks:", nrow(downstream_peaks), "\n")
+if(nrow(downstream_peaks) > 0) {
+  downstream_match_prop <- mean(downstream_peaks$target_matches_nearest, na.rm = TRUE)
+  cat("Proportion where predicted target is closest gene:", round(downstream_match_prop * 100, 1), "%\n")
+}
+
+p1 <- ggplot(expanded_analysis, aes(x = distance_to_target/1000, fill = direction)) +
+  geom_histogram(alpha = 0.7, bins = 30) +
+  facet_wrap(~direction, scales = "free_y") +
+  labs(title = "Distance from ATF4 Peaks to Predicted Target TSSs",
+       subtitle = "Negative = Peak Upstream of TSS, Positive = Peak Downstream of TSS",
+       x = "Distance to Target TSS (kb)",
+       y = "Count",
+       fill = "Peak Position") +
+  theme_minimal() +
+  scale_fill_manual(values = c("Upstream" = "#3498DB", "Downstream" = "#E74C3C")) +
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5)
+
+print(p1)
+
+direction_summary <- expanded_analysis %>%
+  group_by(direction) %>%
+  summarise(
+    n_pairs = n(),
+    n_unique_peaks = n_distinct(peak_id),
+    prop_target_is_nearest = round(mean(target_matches_nearest, na.rm = TRUE) * 100, 1),
+    median_distance = median(abs(distance_to_target), na.rm = TRUE),
+    mean_distance = round(mean(abs(distance_to_target), na.rm = TRUE)),
+    .groups = 'drop'
+  )
+
+print("Summary by Peak Direction:")
+print(direction_summary)
+```
