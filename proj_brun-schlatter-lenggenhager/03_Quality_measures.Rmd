@@ -1,0 +1,243 @@
+---
+title: "Quality measures"
+output: html_document
+date: "2025-06-05"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Quality assessment of the data
+
+```{r message=FALSE, warning=FALSE}
+suppressPackageStartupMessages({
+  library(epiwraps)
+  library(motifmatchr)
+  library(MotifDb)
+  library(universalmotif)
+  library(SummarizedExperiment)
+  library(sechm)
+  library(BiocParallel)
+  library(chromVAR)
+  library(limma)
+  library(edgeR)
+  library(rtracklayer)
+  library(GenomicRanges)
+  library(BiocParallel)
+  library(data.table)
+  library(BSgenome.Mmusculus.UCSC.mm10)
+  library(TxDb.Mmusculus.UCSC.mm10.knownGene)
+  library(ChIPseeker)
+  library(ATACseqQC)
+  library(Rsubread)
+  library(Rsamtools)
+  library(GenomicAlignments)
+  library(Signac)
+  library(SeuratObject)
+  library(viridis)
+  library(ggplot2)
+})
+
+```
+
+### Load data
+
+```{r warning = FALSE}
+# Load peak files and names of the according bam files
+peak_files <- c("ENCFF967VMH.bed.gz", "ENCFF366GHH.bed.gz", "ENCFF767ZBZ.bed.gz")
+names(peak_files) <- c("ENCFF150BMM", "ENCFF194UMD", "ENCFF448HYG")
+
+# Read and process peaks 
+peak_list <- list()
+for(i in 1:length(peak_files)) {
+  sample_name <- names(peak_files)[i]
+  file_path <- peak_files[i]
+  
+  cat("Loading peaks for", sample_name, "from", file_path, "\n")
+  
+  if (file.exists(file_path)) {
+    # Read BED file
+    bed_data <- fread(file_path, header = FALSE)
+    
+    # Convert to GRanges
+    peaks <- GRanges(
+      seqnames = bed_data$V1,
+      ranges = IRanges(start = bed_data$V2 + 1, end = bed_data$V3)  # +1 for 0-based to 1-based
+    )
+    
+    # Keep peaksize
+    peak_list[[sample_name]] <- peaks
+    cat("  Loaded", length(peaks), "peaks\n")
+  }
+}
+
+# Load BSgenome for mouse
+genome <- BSgenome.Mmusculus.UCSC.mm10
+```
+
+### Removal of duplicates in peaks
+
+```{r warning = FALSE}
+# Remove duplicates in three peak groups
+for (i in 1:length(peak_list)){
+  sample_name <- names(peak_files)[i]
+  peaks <- peak_list[[sample_name]]
+  before <- length(peaks)
+  peaks <- reduce(peaks)
+  after <- length(peaks)
+  peak_list[[sample_name]] <- peaks
+  cat("Removed", before-after, "duplicated peaks from", sample_name, "\n")
+}
+```
+
+### Peak widths
+
+```{r warning = FALSE, fig.width=6, fig.height=4}
+# Create a plot for each peak file showing the width distribution for the peaks
+for (i in 1:length(peak_list)){
+  sample_name <- names(peak_files)[i]
+  peaks <- peak_list[[sample_name]]
+  peakWidths <- data.frame(width(peaks))
+  caption <- paste("Image", i, ": Peak widths plotted for sample", sample_name)
+  title <- paste("Peak width distribution for", sample_name)
+  plot_width <- ggplot(peakWidths, aes(x=width.peaks.), size(10)) + 
+    geom_histogram(binwidth = 50) + 
+    geom_histogram(color = "#000000", fill = "#0099F8") + 
+    geom_vline(aes(xintercept = mean(width.peaks.)), color = "#000000", size = 0.75) +
+    geom_vline(aes(xintercept = mean(width.peaks.) + sd(width.peaks.)), color = "#000000", size = 0.5, linetype = "dashed") +
+  geom_vline(aes(xintercept = mean(width.peaks.) - sd(width.peaks.)), color = "#000000", size = 0.5, linetype = "dashed") + 
+    xlim(0, round(max(peakWidths)+50, -2)) + 
+    theme(axis.text=element_text(size=12), axis.title=element_text(size=14)) + 
+    labs(
+    title = title,
+    caption = caption,
+    x = "Peak width",
+    y = "Count"
+  ) +
+    theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.caption = element_text(face = "italic"))
+  plot(plot_width)
+}
+```
+
+### GC Bias
+
+```{r warning = FALSE, fig.width=6, fig.height=4}
+# Read se_object created in the setup and add GC bias
+se <- readRDS("se_object.rds")
+se <- chromVAR::addGCBias(se, genome = BSgenome.Mmusculus.UCSC.mm10)
+
+# Specify title and caption for the plot
+title <- "GC content in peaks"
+caption <- "Image: Amount of GC in all peaks"
+
+# Specify and plot the GC bias calculated in the se object, also shows mean and sd
+bias <- data.frame(mcols(se)$bias)
+plot_bias <- ggplot(bias, aes(x=mcols.se..bias)) + 
+    geom_histogram(binwidth = 0.01) + 
+    geom_histogram(color = "#000000", fill = "#0099F8") + 
+    geom_vline(aes(xintercept = mean(mcols.se..bias)), color = "#000000", size = 0.75) +
+    geom_vline(aes(xintercept = mean(mcols.se..bias) + sd(mcols.se..bias)), color = "#000000", size = 0.5, linetype = "dashed") +
+  geom_vline(aes(xintercept = mean(mcols.se..bias) - sd(mcols.se..bias)), color = "#000000", size = 0.5, linetype = "dashed") + 
+    xlim(0, 1) + 
+    theme(axis.text=element_text(size=12), axis.title=element_text(size=14)) + 
+    labs(
+    title = title,
+    caption = caption,
+    x = "Proportion of GC in peak sequences",
+    y = "Count"
+  ) +
+    theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    plot.caption = element_text(face = "italic"))
+plot(plot_bias)
+```
+
+### Peak position enrichment
+
+```{r warning = FALSE, fig.width=6, fig.height=4}
+# Specify colorblind-readable color-set
+colors <- viridis(11)
+# Plot pie plots for the enrichment of peaks in all three groups
+for (i in 1:length(peak_list)){
+  sample_name <- names(peak_files)[i]
+  peaks <- peak_list[[sample_name]]
+  peakAnnotation <- annotatePeak(peaks, TxDb=TxDb.Mmusculus.UCSC.mm10.knownGene, verbose = FALSE)
+  plotAnnoPie(peakAnnotation, ndigit = 2, cex = 0.9, col=colors, legend.position = "rightside", pie3D = FALSE)
+}
+```
+
+### TSS score commented out for runtime
+
+```{r tss, warning = FALSE}
+# # Define bam_files
+# bam_files <- c("ENCFF150BMM.bam", "ENCFF194UMD.bam", "ENCFF448HYG.bam")
+# names(bam_files) <- c("ENCFF150BMM", "ENCFF194UMD", "ENCFF448HYG")
+# 
+# # Precompute TSS regions for chr1 only
+# txs <- transcripts(TxDb.Mmusculus.UCSC.mm10.knownGene)
+# txs_chr1 <- txs[seqnames(txs) == "chr1"]
+# 
+# TSS_scores <- list()
+# for(bam in bam_files) {
+#   which_region <- GRanges(seqnames = "chr1", 
+#                           ranges = IRanges(1, seqlengths(genome)["chr1"]))
+#   
+#   bamfile <- readBamFile(bam, bigFile = TRUE)
+#   tss <- TSSEscore(bamfile, txs_chr1)
+#   TSS_scores[[bam]] <- tss$TSSEscore
+#   cat("TSS score (chr1 only) for", bam, ":", tss$TSSEscore, "\n")
+# }
+```
+
+### FRiP (manual) commented out for runtime
+
+```{r frip, warning = FALSE}
+# chr1_gr <- GRanges(seqnames = "chr1", 
+#                    ranges = IRanges(1, seqlengths(genome)["chr1"]))
+# 
+# for(bam in bam_files) {
+#   
+#   param_total <- ScanBamParam(which = chr1_gr, 
+#                               flag = scanBamFlag(isUnmappedQuery = FALSE))
+#   total_reads <- countBam(bam, param = param_total)$records
+#   
+#   sample_name <- names(which(bam_files == bam))
+#   peaks <- peak_list[[sample_name]]
+#   peaks_chr1 <- peaks[seqnames(peaks) == "chr1"]
+#   
+#   if (length(peaks_chr1) == 0) {
+#     cat("No peaks on chr1 for", sample_name, "\n")
+#     next
+#   }
+#   
+# 
+#   saf <- data.frame(
+#     GeneID = paste0("peak_", seq_along(peaks_chr1)),
+#     Chr = as.character(seqnames(peaks_chr1)),
+#     Start = start(peaks_chr1),
+#     End = end(peaks_chr1),
+#     Strand = "*"
+#   )
+#   
+# 
+#   feature_counts <- featureCounts(
+#     files = bam,
+#     annot.ext = saf,
+#     isPairedEnd = TRUE,
+#     nthreads = 4,
+#     strandSpecific = 0,
+#     allowMultiOverlap = TRUE,
+#     countChimericFragments = FALSE
+#   )
+#   
+#   reads_in_peaks <- feature_counts$stat[1, 2]
+#   frip_score <- reads_in_peaks / total_reads
+#   
+#   cat("Total reads on chr1 in", bam, ":", total_reads, "\n")
+#   cat("Reads in peaks on chr1:", reads_in_peaks, "\n")
+#   cat("FRiP score (chr1 only) for", bam, ":", frip_score, "\n")
+# }
+``` 

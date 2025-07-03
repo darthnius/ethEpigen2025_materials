@@ -1,0 +1,699 @@
+---
+title: "Chromatin Accessibility and Functional Enrichment Analysis in Mouse Neurons"
+author: "brun-schlatter-lenggenhager"
+output: html_document
+---
+
+```{r setup}
+suppressPackageStartupMessages({
+  library(epiwraps)
+  library(motifmatchr)
+  library(MotifDb)
+  library(universalmotif)
+  library(SummarizedExperiment)
+  library(sechm)
+  library(BiocParallel)
+  library(chromVAR)
+  library(limma)
+  library(edgeR)
+  library(rtracklayer)
+  library(GenomicRanges)
+  library(BiocParallel)
+  library(data.table)
+  library(Rsubread)
+  library(BSgenome.Mmusculus.UCSC.mm10)
+  library(TFBSTools)
+  library(circlize)
+  library(GenomicAlignments)
+  library(ComplexHeatmap)
+  library(ggplot2)
+  library(tidyr)
+  library(dplyr)
+  library(matrixStats)
+  library(ggrepel)
+})
+
+param <- SnowParam(workers = 6)
+```
+
+## 1. Download files
+
+```{r download_data}
+# BAM file URLs
+bam_urls <- c(
+  "https://www.encodeproject.org/files/ENCFF150BMM/@@download/ENCFF150BMM.bam",
+  "https://www.encodeproject.org/files/ENCFF194UMD/@@download/ENCFF194UMD.bam", 
+  "https://www.encodeproject.org/files/ENCFF448HYG/@@download/ENCFF448HYG.bam"
+)
+
+bam_file_names <- c("ENCFF150BMM.bam", "ENCFF194UMD.bam", "ENCFF448HYG.bam")
+
+peak_urls <- c(
+  "https://www.encodeproject.org/files/ENCFF967VMH/@@download/ENCFF967VMH.bed.gz",
+  "https://www.encodeproject.org/files/ENCFF366GHH/@@download/ENCFF366GHH.bed.gz",
+  "https://www.encodeproject.org/files/ENCFF767ZBZ/@@download/ENCFF767ZBZ.bed.gz"
+)
+
+peak_file_names <- c("ENCFF967VMH.bed.gz", "ENCFF366GHH.bed.gz", "ENCFF767ZBZ.bed.gz")
+
+# bw file URLs
+bw_urls <- c(
+  "https://www.encodeproject.org/files/ENCFF939YZM/@@download/ENCFF939YZM.bigWig",
+  "https://www.encodeproject.org/files/ENCFF532SCF/@@download/ENCFF532SCF.bigWig",
+  "https://www.encodeproject.org/files/ENCFF769IKW/@@download/ENCFF769IKW.bigWig"
+)
+
+bw_file_names <- c("ENCFF939YZM.bigWig", "ENCFF532SCF.bigWig", "ENCFF769IKW.bigWig")
+
+
+options(timeout = 6000000000)
+for(i in 1:length(bam_urls)) {
+  if(!file.exists(bam_file_names[i])) {
+    download.file(bam_urls[i], bam_file_names[i], mode = "wb")
+  }
+}
+
+for(i in 1:length(peak_urls)) {
+  if(!file.exists(peak_file_names[i])) {
+    download.file(peak_urls[i], peak_file_names[i], mode = "wb")
+  }
+}
+
+for(i in 1:length(bw_urls)) {
+  if(!file.exists(bw_file_names[i])) {
+    download.file(bw_urls[i], bw_file_names[i], mode = "wb")
+  }
+}
+```
+
+## 2. Create metadata
+
+```{r sample_info}
+# Create sample information
+sample_info <- data.frame(
+  sample_id = c("ENCFF150BMM", "ENCFF194UMD", "ENCFF448HYG"),
+  age_group = c("adult_child", "embryo_postnatal", "unspecified"),
+  neuron_type = c("excitatory", "excitatory", "inhibitory"),
+  stringsAsFactors = FALSE
+)
+
+rownames(sample_info) <- sample_info$sample_id
+print(sample_info)
+```
+
+## 3. Process BAM files and create consensus peaks
+
+```{r process_bams}
+# List BAM files
+bam_files <- c("ENCFF150BMM.bam", "ENCFF194UMD.bam", "ENCFF448HYG.bam")
+names(bam_files) <- c("ENCFF150BMM", "ENCFF194UMD", "ENCFF448HYG")
+
+# Index BAM files
+for(bam in bam_files) {
+  if(!file.exists(paste0(bam, ".bai"))) {
+    cat("Indexing", bam, "\n")
+    Rsamtools::indexBam(bam)
+  }
+}
+
+# Load peak files
+peak_files <- c("ENCFF967VMH.bed.gz", "ENCFF366GHH.bed.gz", "ENCFF767ZBZ.bed.gz")
+names(peak_files) <- c("ENCFF150BMM", "ENCFF194UMD", "ENCFF448HYG")
+
+# Read and process peaks
+peak_list <- list()
+for(i in 1:length(peak_files)) {
+  sample_name <- names(peak_files)[i]
+  file_path <- peak_files[i]
+  
+  cat("Loading peaks for", sample_name, "from", file_path, "\n")
+  
+  if (file.exists(file_path)) {
+    # Read BED file
+    bed_data <- fread(file_path, header = FALSE)
+    
+    # Convert to GRanges
+    peaks <- GRanges(
+      seqnames = bed_data$V1,
+      ranges = IRanges(start = bed_data$V2 + 1, end = bed_data$V3)  # +1 for 0-based to 1-based
+    )
+    
+    # Resize peaks to 300bp
+    peaks <- resize(peaks, width = 300, fix = "center")
+    peak_list[[sample_name]] <- peaks
+    cat("  Loaded", length(peaks), "peaks\n")
+  }
+}
+
+# Determine the minimum number of peaks across all samples
+min_peaks <- min(sapply(peak_list, length))
+cat("Downsampling all peak sets to", min_peaks, "peaks\n")
+
+# Downsample each GRanges object to the same size
+set.seed(123) 
+peak_list_down <- lapply(peak_list, function(peaks) {
+  peaks[sample(seq_along(peaks), min_peaks)]
+})
+
+# Create consensus peaks from the downsampled peak list
+gr_list <- GenomicRanges::GRangesList(peak_list_down)
+all_peaks <- unlist(gr_list, use.names = FALSE)
+consensus_peaks <- GenomicRanges::reduce(all_peaks)
+
+rtracklayer::export(consensus_peaks, "consensus_peaks.bed", format = "BED")
+
+# Print summary
+cat("Summary:\n")
+cat("Number of consensus peaks:", length(consensus_peaks), "\n")
+cat("Peak regions per sample (after downsampling):\n")
+for(i in 1:length(peak_list_down)) {
+  cat(" ", names(peak_list_down)[i], ":", length(peak_list_down[[i]]), "peaks\n")
+}
+```
+
+## 4. Get counts and prepare SummarizedExperiment
+
+We downsampled the original bam files because they don't match in sample depths.
+We used samtools in Ubuntu, here are the sampling fractions we used:
+- **ENCFF150BMM.bam**: 0.011  
+- **ENCFF194UMD.bam**: 0.0115  
+- **ENCFF448HYG.bam**: 1 (not downsampled)
+
+We used the following commands:
+
+```bash
+samtools view -s 0.011 -b ENCFF150BMM.bam -o ENCFF150BMM.downsampled.bam
+samtools index ENCFF150BMM.downsampled.bam
+
+samtools view -s 0.0115 -b ENCFF194UMD.bam -o ENCFF194UMD.downsampled.bam
+samtools index ENCFF194UMD.downsampled.bam
+```
+
+```{r get_counts}
+# Get counts from BAM files usiing rsubreads for memory
+bam_files <- c("ENCFF150BMM.downsampled.bam", 
+               "ENCFF194UMD.downsampled.bam", 
+               "ENCFF448HYG.bam")
+
+set.seed(123)
+peaks_saf <- data.frame(
+  GeneID = paste0("peak_", seq_along(consensus_peaks)),
+  Chr = as.character(seqnames(consensus_peaks)),
+  Start = start(consensus_peaks),
+  End = end(consensus_peaks),
+  Strand = "."
+)
+
+fc_results <- featureCounts(files = bam_files, annot.ext = peaks_saf, 
+                           isGTFAnnotationFile = FALSE, isPairedEnd = TRUE)
+
+se <- SummarizedExperiment(assays = list(counts = fc_results$counts),
+                          rowRanges = consensus_peaks)
+print(se)
+
+colnames(se)
+rownames(sample_info)
+colnames(se) <- c("ENCFF150BMM", "ENCFF194UMD", "ENCFF448HYG")
+colnames(se)
+
+# Add sample information to colData
+colData(se) <- DataFrame(sample_info[colnames(se), ])
+colData(se)
+
+# reference genome 
+genome <- BSgenome.Mmusculus.UCSC.mm10
+
+# Add GC bias correction
+se <- chromVAR::addGCBias(se, genome = genome)
+
+print(se)
+print("Sample depths:")
+print(apply(assay(se), 2, sum))
+```
+
+## 5. Normalize data and prepare design matrix
+
+```{r normalize_design}
+# Create DGEList
+dge <- DGEList(counts = assay(se))
+dge <- calcNormFactors(dge)
+
+# Define as factors
+colData(se)$age_group <- factor(colData(se)$age_group)
+colData(se)$neuron_type <- factor(colData(se)$neuron_type)
+colData(se)
+
+# Create design matrix - neuron type
+design <- model.matrix(~ neuron_type, data = as.data.frame(colData(se)))
+print("Design matrix neuron type:")
+print(design)
+
+# Voom transformation - neuron type
+v <- voom(dge, design, plot = TRUE)
+```
+
+## 6. Fit linear models - neuron type
+
+```{r limma_analysis}
+# Fit the linear model
+fit <- lmFit(v, design)
+fit <- eBayes(fit)
+
+# Diffferential analysis neuron type 
+results_neuron_type <- topTable(fit, coef = "neuron_typeinhibitory", 
+                               number = Inf, sort.by = "P")
+
+# Top 10 inhibitory peaks
+print("Top peaks by neuron type:")
+print("Inhibitory peaks:")
+top_inh <- results_neuron_type[results_neuron_type$logFC > 0, ]
+top_inh <- head(top_inh[order(top_inh$P.Value), ], 10)
+top_inh
+
+# Top 10 excitatory peaks
+print("Excitatory peaks:")
+top_exc <- results_neuron_type[results_neuron_type$logFC < 0, ]
+top_exc <- head(top_exc[order(top_exc$P.Value), ], 10)
+top_exc
+
+# Peak genomic regions
+peak_regions <- rowRanges(se)
+top_inh_indices <- as.integer(sub("peak_", "", rownames(top_inh)))
+top_exc_indices <- as.integer(sub("peak_", "", rownames(top_exc)))
+top_inh_regions <- peak_regions[top_inh_indices]
+top_exc_regions <- peak_regions[top_exc_indices]
+print("Genomic regions of the top inhibitory peaks")
+top_inh_regions
+print("Genomic regions of the top excitatory peaks")
+top_exc_regions
+
+# Volcanao plot
+volcano_data <- results_neuron_type
+volcano_data$logP <- -log10(volcano_data$P.Value)
+
+volcano_data$group <- NA
+volcano_data$label <- NA
+
+volcano_data$group[rownames(volcano_data) %in% rownames(top_inh)] <- "Inhibitory"
+volcano_data$group[rownames(volcano_data) %in% rownames(top_exc)] <- "Excitatory"
+volcano_data$label[rownames(volcano_data) %in% rownames(top_inh)] <- rownames(top_inh)
+volcano_data$label[rownames(volcano_data) %in% rownames(top_exc)] <- rownames(top_exc)
+
+volcano_data$group <- factor(volcano_data$group, levels = c("Excitatory", "Inhibitory"))
+
+ggplot(volcano_data, aes(x = logFC, y = logP)) +
+  geom_point(data = subset(volcano_data, is.na(group)),
+             color = "gray70", alpha = 0.4, size = 1) +
+
+  geom_point(data = subset(volcano_data, !is.na(group)),
+             aes(color = group), size = 1.2, alpha = 0.7) +
+
+  ggrepel::geom_text_repel(
+    data = subset(volcano_data, !is.na(label)),
+    aes(label = label, color = group),
+    size = 3, max.overlaps = 20
+  ) +
+
+  scale_color_manual(
+    values = c("Excitatory" = "blue", "Inhibitory" = "red"),
+    labels = c("Excitatory" = "Top 10 excitatory peaks",
+               "Inhibitory" = "Top 10 inhibitory peaks"),
+    name = "Legend"
+  ) +
+
+  labs(
+    title = "Volcano Plot: Excitatory vs Inhibitory",
+    x = "log2 Fold Change",
+    y = "-log10(P)"
+  ) +
+
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.3) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", linewidth = 0.3) +
+
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_line(color = "gray", linewidth = 0.4),
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(hjust = 0.5)
+  )
+```
+ 
+## 7. Motif accessibility
+
+```{r}
+# Query MotifDb for mouse motifs from HOCOMOCOv10
+motifs_raw <- MotifDb::query(MotifDb::MotifDb, c("HOCOMOCOv10", "Mmusculus"))
+
+# Convert to PWMatrix list compatible with motifmatchr
+motifs <- do.call(
+  TFBSTools::PWMatrixList,
+  setNames(
+    universalmotif::convert_motifs(motifs_raw, class = "TFBSTools-PWMatrix"),
+    mcols(motifs_raw)$geneSymbol
+  )
+)
+
+motifs
+
+# Motif matching
+se_filtered <- se[rowSums(assay(se)) > 0, ]
+motif_ix <- motifmatchr::matchMotifs(motifs, se_filtered, genome = genome)
+dev <- chromVAR::computeDeviations(object = se_filtered, annotations = motif_ix)
+deviation_scores <- assays(dev)$z
+```
+
+### Visualization: pairwise comparison
+```{r}
+# 1. Inhibitory (448) vs Excitatory (150)
+diff_448_150 <- deviation_scores[, "ENCFF448HYG"] - deviation_scores[, "ENCFF150BMM"]
+top_diff_448_150 <- sort(abs(diff_448_150), decreasing = TRUE)[1:20]
+top_motifs_448_150 <- names(top_diff_448_150)
+
+cat("Top motifs: Inhibitory (448) vs Excitatory (150)\n")
+print(top_diff_448_150)
+
+mat_448_150 <- deviation_scores[top_motifs_448_150, c("ENCFF448HYG", "ENCFF150BMM")]
+
+Heatmap(
+  mat_448_150,
+  name = "Deviation Z-score",
+  col = colorRamp2(c(-20, 0, 20), c("blue", "white", "red")),
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  column_title = "Inhibitory (448) vs Excitatory (150)",
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  row_names_gp = grid::gpar(fontsize = 8)
+)
+
+
+# 2. Inhibitory (448) vs Excitatory (194)
+diff_448_194 <- deviation_scores[, "ENCFF448HYG"] - deviation_scores[, "ENCFF194UMD"]
+top_diff_448_194 <- sort(abs(diff_448_194), decreasing = TRUE)[1:20]
+top_motifs_448_194 <- names(top_diff_448_194)
+
+cat("Top motifs: Inhibitory (448) vs Excitatory (194)\n")
+print(top_diff_448_194)
+
+mat_448_194 <- deviation_scores[top_motifs_448_194, c("ENCFF448HYG", "ENCFF194UMD")]
+
+Heatmap(
+  mat_448_194,
+  name = "Deviation Z-score",
+  col = colorRamp2(c(-20, 0, 20), c("blue", "white", "red")),
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  column_title = "Inhibitory (448) vs Excitatory (194)",
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  row_names_gp = grid::gpar(fontsize = 8)
+)
+
+
+# 3. Excitatory (150) vs Excitatory (194)
+diff_150_194 <- deviation_scores[, "ENCFF150BMM"] - deviation_scores[, "ENCFF194UMD"]
+top_diff_150_194 <- sort(abs(diff_150_194), decreasing = TRUE)[1:20]
+top_motifs_150_194 <- names(top_diff_150_194)
+
+cat("Top motifs: Excitatory (150) vs Excitatory (194)\n")
+print(top_diff_150_194)
+
+mat_150_194 <- deviation_scores[top_motifs_150_194, c("ENCFF150BMM", "ENCFF194UMD")]
+
+Heatmap(
+  mat_150_194,
+  name = "Deviation Z-score",
+  col = colorRamp2(c(-20, 0, 20), c("blue", "white", "red")),
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  column_title = "Excitatory (150) vs Excitatory (194)",
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  row_names_gp = grid::gpar(fontsize = 8)
+)
+```
+
+### Visualization across allsamples
+```{r}
+# Combine unique top motifs from the three comparisons
+top_motifs <- unique(c(
+  names(top_diff_448_150),
+  names(top_diff_448_194),
+  names(top_diff_150_194)
+))
+
+# Subset the scores for top motifs
+deviation_top <- deviation_scores[top_motifs, ]
+
+# Calculate variance for each motif across samples
+motif_vars <- rowVars(as.matrix(deviation_top))
+top_var_motifs <- names(sort(motif_vars, decreasing = TRUE)[1:20])
+deviation_subset <- deviation_top[top_var_motifs, ]
+
+Heatmap(
+  deviation_subset,
+  name = "Deviation Z-score",
+  col = colorRamp2(c(-20, 0, 20), c("blue", "white", "red")),
+  cluster_rows = TRUE,
+  cluster_columns = FALSE,
+  column_title = "Samples",
+  row_title = "Motifs",
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  row_names_gp = grid::gpar(fontsize = 8)
+)
+```
+
+## 8. GO enrichment
+
+```{r}
+# Preparing regions
+regions <- rtracklayer::import("consensus_peaks.bed")
+tracks <- c("ENCFF939YZM.bigWig", "ENCFF532SCF.bigWig", "ENCFF769IKW.bigWig")
+names(tracks) <- c("ENCFF939YZM (Excitatory 150)", 
+                   "ENCFF532SCF (Excitatory 194)", 
+                   "ENCFF769IKW (Inhibitory 448)")
+
+# Track summary
+track_summary <- data.frame(
+  Track = character(),
+  Mean_Score = numeric(),
+  Max_Score = numeric(),
+  Nonzero_Regions = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Loop through each track and compute summary
+for (track_name in names(tracks)) {
+  cat("Processing:", track_name, "\n")
+  
+  bw_file <- tracks[track_name]
+  # Import scores over the used regions
+  bw_data <- tryCatch({
+    import(bw_file, which = regions)
+  }, error = function(e) {
+    warning(paste("Failed to import", bw_file))
+    return(NULL)
+  })
+  
+  if (!is.null(bw_data) && length(bw_data) > 0) {
+    scores <- bw_data$score
+    track_summary <- rbind(track_summary, data.frame(
+      Track = track_name,
+      Mean_Score = round(mean(scores), 3),
+      Max_Score = round(max(scores), 3),
+      Nonzero_Regions = sum(scores > 0)
+    ))
+  } else {
+    track_summary <- rbind(track_summary, data.frame(
+      Track = track_name,
+      Mean_Score = NA,
+      Max_Score = NA,
+      Nonzero_Regions = 0
+    ))
+  }
+}
+
+print(track_summary)
+
+ese <- epiwraps::signal2Matrix(tracks, regions, extend = 2000)
+
+# Create ese_subset (only top 10'000 variable rows)
+signal_mat_full <- assays(ese)[["input"]]
+variances <- rowVars(as.matrix(signal_mat_full))
+top_idx <- order(variances, decreasing = TRUE)[1:15000]
+ese_subset <- ese[top_idx, ]
+
+# Add colData (required for assay replacement)
+colnames(ese_subset) <- c("Excitatory_150", "Excitatory_194", "Inhibitory_448")
+
+set.seed(123)
+cl_results <- epiwraps::clusterSignalMatrices(ese_subset, k = 2:10, scaleRows = TRUE)
+
+ggplot(cl_results$varExplained, aes(x = k, y = varExplained)) +
+  geom_line() +
+  geom_point() +
+  labs(
+    title = "Elbow Plot: Variance Explained by Cluster Number",
+    x = "Number of Clusters (k)",
+    y = "Variance Explained"
+  ) +
+  theme_minimal()
+
+cl <- epiwraps::clusterSignalMatrices(ese_subset, k = 4, scaleRows = TRUE)
+table(cl)
+rowData(ese_subset)$cluster <- cl
+
+custom_colors <- list(
+  c("white", "darkred"),     
+  c("white", "darkred"),     
+  c("white", "darkred")
+)
+
+# Plot the heatmaps
+epiwraps::plotEnrichedHeatmaps(
+  ese_subset,
+  row_split = rowData(ese_subset)$cluster,
+  colors = custom_colors,
+  scale_title = "Signal intensity"
+)
+```
+
+### Vizualisation Cluster 1
+```{r}
+# Split peaks by cluster
+split_regions <- split(rowRanges(ese_subset), rowData(ese_subset)$cluster)
+
+# Run enrichment for cluster 1
+res_1 <- rGREAT::great(
+  split_regions[["1"]],
+  gene_sets = "GO:BP",
+  tss_source = "mm10",  # assuming mouse
+  background = rowRanges(ese_subset),
+  cores = 2
+)
+
+# Extract top Biological Process terms
+bp_1 <- rGREAT::getEnrichmentTables(res_1)
+
+# Plot top 15 terms
+ggplot(head(bp_1, 15), aes(fold_enrichment, reorder(description, p_adjust),
+                         size = observed_region_hits,
+                         color = -log10(p_adjust))) +
+  geom_point() +
+  scale_color_viridis_c() +
+  labs(x = "Fold Enrichment", y = "GO Term",
+  title = "Top GO Terms Enriched in Cluster 1")
+```
+
+### Vizualisation Cluster 2
+```{r}
+# Run enrichment for cluster 2
+res_2 <- rGREAT::great(
+  split_regions[["2"]],
+  gene_sets = "GO:BP",
+  tss_source = "mm10",
+  background = rowRanges(ese_subset),
+  cores = 2
+)
+
+# Extract GO terms
+bp_2 <- rGREAT::getEnrichmentTables(res_2)
+
+# Plot
+ggplot(head(bp_2, 15), aes(fold_enrichment, reorder(description, p_adjust),
+                         size = observed_region_hits,
+                         color = -log10(p_adjust))) +
+  geom_point() +
+  scale_color_viridis_c() +
+  labs(x = "Fold Enrichment", y = "GO Term",
+  title = "Top GO Terms Enriched in Cluster 2")
+```
+
+### Vizualisation Cluster 3
+```{r}
+# Run enrichment for cluster 3
+res_3 <- rGREAT::great(
+  split_regions[["3"]],
+  gene_sets = "GO:BP",
+  tss_source = "mm10",
+  background = rowRanges(ese_subset),
+  cores = 2
+)
+
+# Extract GO terms
+bp_3 <- rGREAT::getEnrichmentTables(res_3)
+
+# Plot
+ggplot(head(bp_3, 15), aes(fold_enrichment, reorder(description, p_adjust),
+                         size = observed_region_hits,
+                         color = -log10(p_adjust))) +
+  geom_point() +
+  scale_color_viridis_c() +
+  labs(x = "Fold Enrichment", y = "GO Term",
+       title = "Top GO Terms Enriched in Cluster 3")
+```
+
+### Vizualisation Cluster 4
+```{r}
+# Run enrichment for cluster 4
+res_4 <- rGREAT::great(
+  split_regions[["4"]],
+  gene_sets = "GO:BP",
+  tss_source = "mm10",
+  background = rowRanges(ese_subset),
+  cores = 2
+)
+
+# Extract GO terms
+bp_4 <- rGREAT::getEnrichmentTables(res_4)
+
+# Plot
+ggplot(head(bp_4, 15), aes(fold_enrichment, reorder(description, p_adjust),
+                         size = observed_region_hits,
+                         color = -log10(p_adjust))) +
+  geom_point() +
+  scale_color_viridis_c() +
+  labs(x = "Fold Enrichment", y = "GO Term",
+       title = "Top GO Terms Enriched in Cluster 4")
+```
+
+### ### Vizualisation all Clusters
+```{r}
+# GO enrichment comparison across all clusters
+top_terms <- lapply(list(bp_1, bp_2, bp_3, bp_4), function(bp) {
+  bp %>%
+    arrange(p_adjust) %>%
+    slice_head(n = 8)
+})
+
+# Collect unique GO terms
+all_terms <- unique(unlist(lapply(top_terms, function(x) x$description)))
+
+# Initialize matrix for -log10(p_adjust)
+go_mat <- matrix(NA, nrow = length(all_terms), ncol = 4,
+                 dimnames = list(all_terms, paste0("Cluster ", 1:4)))
+
+# Fill the matrix
+for (i in 1:4) {
+  bp <- get(paste0("bp_", i))
+  matched <- match(all_terms, bp$description)
+  padj <- bp$p_adjust[matched]
+  padj[is.na(padj)] <- 1  # Replace NA with 1 (non-significant)
+  go_mat[, i] <- -log10(padj)
+}
+
+# Cap extreme values
+go_mat[go_mat > 10] <- 10
+
+# Draw the heatmap
+pheatmap(go_mat,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         color = colorRampPalette(c("white", "skyblue", "darkblue"))(100),
+         main = "GO Biological Process Enrichment by Cluster",
+         fontsize_row = 8,
+         fontsize_col = 10,
+         border_color = NA,
+         name = "−log10(p-adj)")
+```

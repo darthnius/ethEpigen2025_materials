@@ -1,0 +1,470 @@
+---
+title: "t-SNE Visualizatiion and GO Enrichment Analysis Human Brain snATAC-seq"
+author: "Nils Schlatter"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+    toc_depth: 3
+params:
+  threshold: 2
+  top_n: 5000
+  max_regions: 10000
+  workers: 4
+  ontology: "BP"
+  backgrounds: ["accessible", "genome", "self"] 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, 
+                      fig.width = 12, fig.height = 8, cache.path = "cache/")
+set.seed(123)
+if (!dir.exists("cache")) dir.create("cache", recursive = TRUE)
+```
+
+## Libraries
+```{r libraries, message=FALSE}
+suppressPackageStartupMessages({
+  library(rtracklayer); library(GenomicRanges); library(BiocFileCache)
+  library(rGREAT);      library(ChIPseeker);   library(clusterProfiler)
+  library(org.Hs.eg.db);library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+  library(BiocParallel);library(dplyr);        library(ggplot2)
+  library(DT);          library(enrichplot);   library(cli)
+  library(Rtsne);       library(ggrepel);      library(pheatmap)
+  library(UpSetR);      library(tidyr);         library(tibble)
+  library(cowplot);     library(patchwork)
+})
+```
+
+## Configuration
+```{r config}
+param <- MulticoreParam(workers = params$workers)
+cache_dir <- path.expand("~/.cache/BiocFileCache")
+if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE, mode = "0755")
+bfc <- BiocFileCache(cache = cache_dir)
+
+# Databases
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+base_url <- "https://decoder-genetics.wustl.edu/catlasv1/catlas_downloads/humanbrain/bigwig/"
+
+# Cell type groups
+cell_type_groups <- list(
+  Excitatory = c("ITL4_1","ITL4_2","ITL5_1","ITL5_2","ITL5_3","ITL5_4",
+                 "ITL6_1_1","ITL6_1_2","ITL6_2_1","ITL6_2_2","ITL23_1","ITL23_2"),
+  Inhibitory = c("PVALB_1","PVALB_2","PVALB_3","PVALB_4","PV_ChCs",
+                 "SST_1","SST_2","SST_3","SST_4","SST_5","SST_CHODL",
+                 "VIP_1","VIP_2","VIP_3","VIP_4","VIP_5","VIP_6","VIP_7",
+                 "LAMP5_1","LAMP5_2","SNCG_1","SNCG_2","SNCG_3","SNCG_4","SNCG_5"),
+  Glia = c("ASCT_1","ASCT_2","ASCT_3","ASCNT_1","ASCNT_2","ASCNT_3",
+           "OGC_1","OGC_2","OGC_3","OPC","MGC_1","MGC_2"),
+  Other = c("MSN_1","MSN_2","MSN_3","D1CaB","D2CaB","D1Pu","D2Pu")
+)
+all_cell_types <- unlist(cell_type_groups)
+
+# Colors
+group_colors <- c(Excitatory = "#E31A1C", Inhibitory = "#1F78B4",
+                  Glia = "#33A02C", Other = "#FF7F00")
+
+expand_ontology_name <- function(ont) {
+  switch(ont, BP = "Biological Process", MF = "Molecular Function",
+              CC = "Cellular Component", ont)
+}
+
+background_names <- c(
+  accessible = "Accessible Background",
+  genome = "Genome Background",
+  self = "Self Background"
+)
+
+cli::cli_alert_info("Processing {length(all_cell_types)} cell types in {length(cell_type_groups)} groups")
+```
+
+## Background Comparison Explained
+The analysis compares **three different background gene sets** for GO enrichment:
+
+1. **`accessible`**  
+   Genes accessible in *any* cell type  
+   *Answers: "What makes this cell group unique compared to others?"*
+
+2. **`genome`**  
+   All annotated genes in the genome  
+   *Answers: "What biological functions are overrepresented vs. the whole genome?"*
+
+3. **`self`**  
+   Only genes accessible in the *current group*  
+   *Answers: "What functions are enriched within the group's own accessible genes?"*
+
+```{r bg-definitions, include=FALSE}
+# Define universes in this chunk
+all_genes <- keys(org.Hs.eg.db, keytype = "ENTREZID")
+```
+
+## Helper Functions
+```{r functions}
+# Download/parse bigWig regions
+get_accessible_regions <- function(cell_type) {
+  url <- paste0(base_url, cell_type, ".bw")
+  bw <- tryCatch({
+    options(timeout = 900)
+    file <- bfcrpath(bfc, url)
+    if (!file.exists(file) || file.size(file) == 0) return(GRanges())
+    import(file, format = "BigWig")
+  }, error = function(e) GRanges())
+  options(timeout = 60)
+  if (length(bw) == 0) return(GRanges())
+  bw <- bw[!is.na(bw$score) & bw$score > params$threshold]
+  if (length(bw) > params$top_n) bw <- head(bw[order(bw$score, decreasing = TRUE)], params$top_n)
+  bw
+}
+
+# Combine group ranges
+combine_group_ranges <- function(cts) {
+  valid <- Filter(function(x) length(x) > 0, accessibility_regions[cts])
+  if (length(valid) == 0) return(GRanges())
+  comb <- reduce(Reduce(c, valid))
+  if (length(comb) > params$max_regions) comb <- head(comb, params$max_regions)
+  comb
+}
+
+# GO enrichment with selectable background
+perform_go_enrichment <- function(ranges, group_name, background = c("accessible","genome","self")) {
+  background <- match.arg(background)
+  if (length(ranges) < 100) { cli::cli_alert_warning("{group_name}: too few regions ({length(ranges)})"); return(NULL) }
+  ann <- tryCatch({ annotatePeak(ranges, TxDb = txdb, annoDb = "org.Hs.eg.db",
+                                 tssRegion = c(-3000, 3000), verbose = FALSE) },
+                  error = function(e) NULL)
+  if (is.null(ann)) return(NULL)
+  genes <- unique(na.omit(ann@anno$geneId))
+  if (length(genes) < 10) return(NULL)
+  cli::cli_alert_info("{group_name}: {length(genes)} genes")
+  universe <- switch(background,
+                     accessible = universe_genes_accessible,
+                     genome      = all_genes,
+                     self        = genes)
+  go_list <- lapply(c("BP","MF","CC"), function(ont) {
+    res <- tryCatch({enrichGO(gene = genes, OrgDb = org.Hs.eg.db, ont = ont,
+                              universe = universe, pvalueCutoff = 0.05,
+                              qvalueCutoff = 0.2, readable = TRUE)}, error=function(e) NULL)
+    if (!is.null(res) && nrow(res@result) > 0) {
+      res <- tryCatch(simplify(res, cutoff = 0.7), error=function(e) res)
+    }
+    res
+  })
+  names(go_list) <- c("BP","MF","CC")
+  c(go_list, list(n_genes = length(genes), n_regions = length(ranges)))
+}
+
+# Extract enriched terms
+extract_enriched_terms <- function(enrich_res, ontology = params$ontology, top_n = 10) {
+  do.call(rbind, lapply(names(enrich_res), function(grp){
+    res <- enrich_res[[grp]][[ontology]]
+    if (!inherits(res, "enrichResult") || is.null(res)) return(NULL)
+    df  <- as.data.frame(res)
+    if (nrow(df) == 0) return(NULL)
+    df$Group <- grp
+    df[1:min(nrow(df), top_n), c("ID","Description","p.adjust","Group")]
+  }))
+}
+
+# Create summary table
+create_summary <- function(results) {
+  summary_df <- data.frame()
+  
+  for (grp in names(results)) {
+    res_grp <- results[[grp]]
+    
+    for (ont in c("BP","MF","CC")) {
+      if (!is.null(res_grp) && !is.null(res_grp[[ont]]) && nrow(res_grp[[ont]]@result) > 0) {
+        top_term <- res_grp[[ont]]@result[1, ]
+        summary_df <- rbind(summary_df, data.frame(
+          Group = grp, 
+          Ontology = expand_ontology_name(ont),
+          Significant_Terms = nrow(res_grp[[ont]]@result),
+          Top_Term = top_term$Description,
+          Top_P_Value = top_term$p.adjust,
+          Gene_Count = top_term$Count
+        ))
+      } else {
+        summary_df <- rbind(summary_df, data.frame(
+          Group = grp, 
+          Ontology = expand_ontology_name(ont),
+          Significant_Terms = 0,
+          Top_Term = ifelse(is.null(res_grp), "Analysis failed", "No significant terms"),
+          Top_P_Value = NA_real_,
+          Gene_Count = NA_integer_
+        ))
+      }
+    }
+  }
+  return(summary_df)
+}
+
+# Generate ontology plots
+generate_ontology_plots <- function(enrich_list, ont, bg_name) {
+  plot_list <- list()
+  for (grp in names(enrich_list)) {
+    res <- enrich_list[[grp]]
+    if (is.null(res) || is.null(res[[ont]])) next
+    if (nrow(res[[ont]]@result) == 0) next
+    
+    plot_list[[grp]] <- dotplot(res[[ont]], showCategory = 10, font.size = 11) +
+      ggtitle(grp) +
+      theme_minimal() +
+      scale_color_gradient(
+        low = group_colors[[grp]], 
+        high = "darkred",
+        name = "-log10(adj-p)",
+        trans = "log10"
+      ) +
+      theme(
+        plot.title = element_text(face = "bold", size = 12, hjust = 0.5),
+        legend.position = "bottom",
+        plot.margin = margin(5, 10, 5, 10)
+      ) +
+      guides(color = guide_colorbar(barwidth = 10, barheight = 0.8))
+  }
+  return(plot_list)
+}
+```
+
+## Load & Process Accessibility Data
+```{r process-data, cache=TRUE}
+cli::cli_h2("Loading accessibility data")
+accessibility_regions <- bplapply(all_cell_types, get_accessible_regions, BPPARAM = param)
+names(accessibility_regions) <- all_cell_types
+
+# Combine to group level
+group_accessibility <- lapply(cell_type_groups, combine_group_ranges)
+region_counts <- sapply(group_accessibility, length)
+cli::cli_alert_success("Region counts: {paste(names(region_counts), region_counts, sep='=', collapse=', ')}")
+```
+
+## Define Background Universes
+```{r universes}
+# Genes from all accessible regions (across all cell types)
+cli::cli_h2("Computing accessible-gene universe")
+all_annots <- bplapply(accessibility_regions, function(gr){
+  if (length(gr)==0) return(NULL)
+  ann <- tryCatch({annotatePeak(gr, TxDb=txdb, annoDb="org.Hs.eg.db",
+                               tssRegion=c(-3000,3000), verbose=FALSE)},
+                  error=function(e) NULL)
+  if (is.null(ann)) return(NULL)
+  unique(na.omit(ann@anno$geneId))
+}, BPPARAM = param)
+universe_genes_accessible <- unique(unlist(all_annots))
+cli::cli_alert_success("Background universe sizes:")
+cli::cli_ul(c(
+  "Genome-wide: {format(length(all_genes), big.mark = ',')} genes",
+  "Accessible regions: {format(length(universe_genes_accessible), big.mark = ',')} genes"
+))
+```
+
+## t-SNE Visualization
+```{r tsne, cache=TRUE}
+cli::cli_h2("Creating t-SNE visualization")
+
+# Create union of regions (limited for performance)
+union_regions <- reduce(Reduce(c, accessibility_regions))
+if (length(union_regions) > 5000) union_regions <- head(union_regions, 5000)
+
+# Build score matrix
+score_mat <- vapply(accessibility_regions, function(gr) {
+  v <- numeric(length(union_regions))
+  if (length(gr) > 0) {
+    ov <- findOverlaps(union_regions, gr)
+    v[queryHits(ov)] <- gr$score[subjectHits(ov)]
+  }
+  v
+}, FUN.VALUE = numeric(length(union_regions)))
+
+score_mat <- t(score_mat)
+rownames(score_mat) <- all_cell_types
+
+# Run t-SNE
+perp <- min(30, floor((nrow(score_mat) - 1) / 3))
+tsne_res <- Rtsne::Rtsne(score_mat, perplexity = perp, check_duplicates = FALSE, verbose = FALSE)
+
+# Prepare data for plotting
+tsne_df <- data.frame(
+  tSNE1 = tsne_res$Y[, 1],
+  tSNE2 = tsne_res$Y[, 2],
+  CellType = rownames(score_mat)
+)
+
+cell_type_to_group <- unlist(lapply(names(cell_type_groups), function(g) {
+  setNames(rep(g, length(cell_type_groups[[g]])), cell_type_groups[[g]])
+}))
+tsne_df$Group <- cell_type_to_group[tsne_df$CellType]
+
+# Create plot
+ggplot(tsne_df, aes(tSNE1, tSNE2, colour = Group)) +
+  geom_point(size = 3, alpha = 0.9) +
+  geom_text_repel(aes(label = CellType), size = 3, max.overlaps = 15) +
+  scale_colour_manual(values = group_colors) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom",
+        plot.title = element_text(size = 16, face = "bold", hjust = 0.5)) +
+  labs(title = "t-SNE of Chromatin Accessibility Profiles",
+       x = "t-SNE 1", y = "t-SNE 2", colour = "Cell-type group")
+```
+
+## Run GO Enrichment for All Backgrounds
+```{r enrichment, cache=TRUE}
+backgrounds <- params$backgrounds
+cli::cli_h2("Running enrichment for backgrounds: {paste(backgrounds, collapse=', ')}")
+
+enrichment_results_all <- setNames(vector("list", length(backgrounds)), backgrounds)
+for (bg in backgrounds) {
+  enrichment_results_all[[bg]] <- lapply(names(group_accessibility), function(grp) {
+    perform_go_enrichment(group_accessibility[[grp]], grp, background = bg)
+  })
+  names(enrichment_results_all[[bg]]) <- names(group_accessibility)
+}
+
+# Use accessible background as main results for single-background plots
+enrichment_results <- enrichment_results_all[["accessible"]]
+successful_groups <- sum(sapply(enrichment_results, Negate(is.null)))
+cli::cli_alert_success("Completed enrichment for {successful_groups}/{length(enrichment_results)} groups")
+```
+
+## Results by Background and Ontology
+
+```{r multi-ontology-plots, fig.width=14, fig.height=9, results='hold'}
+# Create master list to store all plots
+all_plots <- list()
+
+for (bg in params$backgrounds) {
+  bg_plots <- list()
+  bg_name <- background_names[[bg]]
+  
+  # Generate plots for each ontology
+  for (ont in c("BP", "MF", "CC")) {
+    ont_plots <- generate_ontology_plots(enrichment_results_all[[bg]], ont, bg_name)
+    
+    # Skip if no plots generated
+    if (length(ont_plots) == 0) next
+    
+    # Arrange in grid
+    grid_plot <- wrap_plots(ont_plots, ncol = 2, guides = "collect") +
+      plot_annotation(
+        title = paste(bg_name, "-", expand_ontology_name(ont)),
+        theme = theme(plot.title = element_text(size = 16, face = "bold", hjust = 0.5))
+      ) & theme(legend.position = "bottom")
+    
+    # Store in master list
+    bg_plots[[ont]] <- grid_plot
+  }
+  all_plots[[bg]] <- bg_plots
+}
+
+# Print all plots
+for (bg in names(all_plots)) {
+  bg_name <- background_names[[bg]]
+  cli::cli_h2("{bg_name} Results")
+  for (ont in names(all_plots[[bg]])) {
+    print(all_plots[[bg]][[ont]])
+    cat("\n\n")
+  }
+}
+```
+
+## Background Comparison Analysis
+
+### Top GO Term Enrichment (-log10 adj-p)
+```{r heatmap, fig.width=14, fig.height=10}
+ontology <- params$ontology
+cli::cli_h2("Building heatmap for ontology: {expand_ontology_name(ontology)}")
+
+# Aggregate results across all backgrounds
+df_list <- lapply(names(enrichment_results_all), function(bg){
+  df <- extract_enriched_terms(enrichment_results_all[[bg]], ontology = ontology)
+  if (!is.null(df)) df$Background <- bg
+  df
+})
+go_df_all <- do.call(rbind, df_list)
+
+if (nrow(go_df_all) == 0) {
+  cli::cli_alert_danger("No significant terms found - skipping heatmap")
+} else {
+  heatmap_df <- go_df_all %>%
+    mutate(term = paste(Description, ID, sep = " | "),
+           logp = -log10(p.adjust + 1e-10)) %>%
+    select(Group, Background, term, logp) %>%
+    unite(GroupBG, Group, Background, sep = "_") %>%
+    pivot_wider(names_from = GroupBG, values_from = logp, values_fill = 0)
+  mat <- as.matrix(heatmap_df[,-1])
+  rownames(mat) <- heatmap_df$term
+  
+  # Create column annotations
+  col_annot <- data.frame(
+    Group = gsub("_.*", "", colnames(mat)),
+    Background = gsub(".*_", "", colnames(mat))
+  )
+  rownames(col_annot) <- colnames(mat)
+  
+  ann_colors <- list(
+    Group = group_colors,
+    Background = c(accessible = "#4DAF4A", genome = "#377EB8", self = "#E41A1C")
+  )
+  
+  pheatmap(mat,
+           cluster_rows = TRUE, 
+           cluster_cols = TRUE,
+           color = colorRampPalette(c("white", "skyblue", "firebrick"))(100),
+           main = paste("GO", expand_ontology_name(ontology), "Enrichment Comparison"),
+           fontsize_row = 8, 
+           fontsize_col = 9,
+           annotation_col = col_annot,
+           annotation_colors = ann_colors,
+           labels_col = gsub("_", "\n", colnames(mat)),
+           angle_col = 45,
+           cellwidth = 20,
+           cellheight = 12,
+           border_color = NA)
+}
+```
+
+### Shared Enriched Terms
+```{r upset, fig.width=14, fig.height=8}
+cli::cli_h2("Term Overlap Between Backgrounds and Groups")
+if (nrow(go_df_all) > 0) {
+  term_lists <- go_df_all %>%
+    mutate(key = paste(Group, Background, sep = "_")) %>%
+    group_by(key) %>%
+    summarise(terms = list(unique(paste(Description, ID, sep = " | "))), .groups = 'drop') %>%
+    deframe()
+  
+  upset(fromList(term_lists), 
+        nsets = length(term_lists), 
+        order.by = "freq",
+        sets = names(term_lists),
+        mainbar.y.label = "Number of Shared GO Terms",
+        sets.x.label = "Terms per Background/Group",
+        text.scale = 1.2,
+        point.size = 3,
+        line.size = 1)
+} else {
+  cli::cli_alert_warning("No significant terms for UpSet plot")
+}
+```
+
+## Parameters
+```{r summary, results='asis'}
+cat("\n### Analysis Parameters\n")
+cat("- **Backgrounds used:**", paste(params$backgrounds, collapse = ", "), "\n")
+cat("- **Primary ontology for comparison:**", expand_ontology_name(params$ontology), "\n")
+cat("- **Score threshold:**", params$threshold, "\n")
+cat("- **Max regions per cell type:**", format(params$top_n, big.mark = ","), "\n")
+cat("- **Max regions per group:**", format(params$max_regions, big.mark = ","), "\n")
+cat("- **Workers:**", params$workers, "\n")
+
+cat("- **System Info:**\n")
+sys_info <- Sys.info()
+cat(paste0("  - ", names(sys_info), ": ", sys_info, collapse = "\n"), "\n")
+
+cat("\n- **Session Info:**\n")
+cat(capture.output(sessionInfo()), sep = "\n")
+```

@@ -1,0 +1,334 @@
+---
+title: "GO Enrichment Analysis"
+author: "Nils Schlatter"
+date: "`10.06.2025`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+params:
+  threshold: 2
+  top_n: 5000
+  max_regions: 10000
+  workers: 4  
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, 
+                      fig.width = 12, fig.height = 8, cache.path = "cache/")
+set.seed(123)
+if (!dir.exists("cache")) dir.create("cache", recursive = TRUE)
+```
+
+```{r libraries, message=FALSE}
+suppressPackageStartupMessages({
+  library(rtracklayer); library(GenomicRanges); library(BiocFileCache)
+  library(rGREAT); library(ChIPseeker); library(clusterProfiler)
+  library(org.Hs.eg.db); library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+  library(BiocParallel); library(dplyr); library(ggplot2)
+  library(DT); library(enrichplot); library(cli)
+})
+```
+
+```{r config}
+# Setup
+param <- MulticoreParam(workers = params$workers)
+cache_dir <- path.expand("~/.cache/BiocFileCache")
+if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE, mode = "0755")
+bfc <- BiocFileCache(cache = cache_dir)
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+base_url <- "https://decoder-genetics.wustl.edu/catlasv1/catlas_downloads/humanbrain/bigwig/"
+
+# Cell type groups
+cell_type_groups <- list(
+  Excitatory = c("ITL4_1","ITL4_2","ITL5_1","ITL5_2","ITL5_3","ITL5_4","ITL6_1_1","ITL6_1_2","ITL6_2_1","ITL6_2_2","ITL23_1","ITL23_2"),
+  Inhibitory = c("PVALB_1","PVALB_2","PVALB_3","PVALB_4","PV_ChCs","SST_1","SST_2","SST_3","SST_4","SST_5","SST_CHODL","VIP_1","VIP_2","VIP_3","VIP_4","VIP_5","VIP_6","VIP_7","LAMP5_1","LAMP5_2","SNCG_1","SNCG_2","SNCG_3","SNCG_4","SNCG_5"),
+  Glia = c("ASCT_1","ASCT_2","ASCT_3","ASCNT_1","ASCNT_2","ASCNT_3","OGC_1","OGC_2","OGC_3","OPC","MGC_1","MGC_2"),
+  Other = c("MSN_1","MSN_2","MSN_3","D1CaB","D2CaB","D1Pu","D2Pu")
+)
+
+all_cell_types <- unlist(cell_type_groups)
+cli::cli_alert_info("Processing {length(all_cell_types)} cell types in {length(cell_type_groups)} groups")
+```
+
+## Data Processing
+
+```{r process-data, cache=TRUE}
+# Process accessibility regions
+get_accessible_regions <- function(cell_type) {
+  url <- paste0(base_url, cell_type, ".bw")
+  
+  bw <- tryCatch({
+    options(timeout = 900)
+    cached_file <- bfcrpath(bfc, url)
+    if (!file.exists(cached_file) || file.size(cached_file) == 0) return(GRanges())
+    import(cached_file, format = "BigWig")
+  }, error = function(e) return(GRanges()))
+  
+  options(timeout = 60)
+  
+  if (length(bw) == 0) return(GRanges())
+  
+  # Filter and select top regions
+  bw <- bw[!is.na(bw$score) & bw$score > params$threshold]
+  if (length(bw) > params$top_n) {
+    bw <- head(bw[order(bw$score, decreasing = TRUE)], params$top_n)
+  }
+  
+  return(bw)
+}
+
+# Process all cell types
+cli::cli_h2("Loading accessibility data")
+accessibility_regions <- bplapply(all_cell_types, get_accessible_regions, BPPARAM = param)
+names(accessibility_regions) <- all_cell_types
+
+# Combine regions per group
+combine_group_ranges <- function(cell_types) {
+  valid_ranges <- Filter(function(x) length(x) > 0, accessibility_regions[cell_types])
+  if (length(valid_ranges) == 0) return(GRanges())
+  
+  combined <- reduce(Reduce(c, valid_ranges))
+  if (length(combined) > params$max_regions) {
+    combined <- head(combined, params$max_regions)
+  }
+  return(combined)
+}
+
+group_accessibility <- lapply(cell_type_groups, combine_group_ranges)
+names(group_accessibility) <- names(cell_type_groups)
+
+# Summary statistics
+region_counts <- sapply(group_accessibility, length)
+cli::cli_alert_success("Region counts: {paste(names(region_counts), region_counts, sep='=', collapse=', ')}")
+```
+
+## GO Enrichment Analysis
+
+```{r go-analysis, cache=TRUE}
+perform_go_enrichment <- function(ranges, group_name) {
+  if (length(ranges) < 100) {
+    cli::cli_alert_warning("{group_name}: too few regions ({length(ranges)})")
+    return(NULL)
+  }
+  
+  # Annotate peaks
+  annotation <- tryCatch({
+    annotatePeak(ranges, TxDb = txdb, annoDb = "org.Hs.eg.db", 
+                tssRegion = c(-3000, 3000), verbose = FALSE)
+  }, error = function(e) return(NULL))
+  
+  if (is.null(annotation)) return(NULL)
+  
+  genes <- unique(na.omit(annotation@anno$geneId))
+  if (length(genes) < 10) return(NULL)
+  
+  cli::cli_alert_info("{group_name}: analyzing {length(genes)} genes")
+  
+  # GO enrichment for each ontology
+  go_results <- lapply(c("BP","MF","CC"), function(ont) {
+    res <- tryCatch({
+      enrichGO(gene = genes, OrgDb = org.Hs.eg.db, ont = ont,
+               pvalueCutoff = 0.05, qvalueCutoff = 0.2, readable = TRUE)
+    }, error = function(e) return(NULL))
+    
+    if (!is.null(res) && nrow(res@result) > 0) {
+      res <- tryCatch(simplify(res, cutoff = 0.7), error = function(e) res)
+    }
+    return(res)
+  })
+  
+  names(go_results) <- c("BP","MF","CC")
+  return(c(go_results, list(n_genes = length(genes), n_regions = length(ranges))))
+}
+
+# Run enrichment analysis
+cli::cli_h2("Running GO enrichment")
+enrichment_results <- lapply(names(group_accessibility), function(grp) {
+  perform_go_enrichment(group_accessibility[[grp]], grp)
+})
+names(enrichment_results) <- names(group_accessibility)
+
+successful_groups <- sum(sapply(enrichment_results, Negate(is.null)))
+cli::cli_alert_success("Completed enrichment for {successful_groups}/{length(enrichment_results)} groups")
+```
+
+## Results
+
+```{r visualizations, fig.width=14, fig.height=10}
+# Function to create expanded ontology names
+expand_ontology_name <- function(ont) {
+  switch(ont,
+    "BP" = "Biological Process",
+    "MF" = "Molecular Function", 
+    "CC" = "Cellular Component",
+    ont
+  )
+}
+
+# Custom color palette for groups
+group_colors <- c(
+  "Excitatory" = "#E31A1C",
+  "Inhibitory" = "#1F78B4", 
+  "Glia" = "#33A02C",
+  "Other" = "#FF7F00"
+)
+
+# Create enhanced dot plots
+for (grp in names(enrichment_results)) {
+  res <- enrichment_results[[grp]]
+  if (is.null(res)) next
+  
+  for (ont in c("BP","MF","CC")) {
+    go_res <- res[[ont]]
+    if (!is.null(go_res) && nrow(go_res@result) > 0) {
+      tryCatch({
+        # Create enhanced plot
+        p <- dotplot(go_res, showCategory = 15, font.size = 11) +
+          ggtitle(paste0(grp, " Neurons – ", expand_ontology_name(ont))) +
+          theme_minimal(base_size = 12) +
+          theme(
+            plot.title = element_text(size = 16, face = "bold", hjust = 0.5, 
+                                    margin = margin(b = 20)),
+            axis.text.y = element_text(size = 10),
+            axis.text.x = element_text(size = 10),
+            axis.title = element_text(size = 12, face = "bold"),
+            legend.title = element_text(size = 11, face = "bold"),
+            legend.text = element_text(size = 10),
+            panel.grid.major = element_line(color = "grey90", size = 0.5),
+            panel.grid.minor = element_line(color = "grey95", size = 0.3),
+            panel.border = element_rect(color = "grey80", fill = NA, size = 0.5)
+          ) +
+          scale_color_gradient(low = group_colors[[grp]], high = "darkred",
+                             name = "Adjusted\nP-value", 
+                             trans = "log10",
+                             labels = scales::scientific) +
+          scale_size_continuous(name = "Gene\nCount", 
+                              range = c(3, 8),
+                              breaks = scales::pretty_breaks(n = 4)) +
+          labs(
+            x = "Gene Ratio",
+            y = "GO Terms",
+            caption = paste0("Top 15 enriched terms • ", 
+                           nrow(go_res@result), " total significant terms")
+          )
+        
+        print(p)
+        
+        # Add some spacing between plots
+        cat("\n\n")
+        
+      }, error = function(e) {
+        cli::cli_alert_warning("Failed to create plot for {grp} - {ont}: {e$message}")
+      })
+    }
+  }
+}
+```
+
+```{r summary-table}
+# Create summary table with expanded ontology names
+create_summary <- function(results) {
+  summary_df <- data.frame()
+  
+  for (grp in names(results)) {
+    res_grp <- results[[grp]]
+    
+    for (ont in c("BP","MF","CC")) {
+      if (!is.null(res_grp) && !is.null(res_grp[[ont]]) && nrow(res_grp[[ont]]@result) > 0) {
+        top_term <- res_grp[[ont]]@result[1, ]
+        summary_df <- rbind(summary_df, data.frame(
+          Group = grp, 
+          Ontology = expand_ontology_name(ont),
+          Significant_Terms = nrow(res_grp[[ont]]@result),
+          Top_Term = top_term$Description,
+          Top_P_Value = top_term$p.adjust,
+          Gene_Count = top_term$Count
+        ))
+      } else {
+        summary_df <- rbind(summary_df, data.frame(
+          Group = grp, 
+          Ontology = expand_ontology_name(ont),
+          Significant_Terms = 0,
+          Top_Term = ifelse(is.null(res_grp), "Analysis failed", "No significant terms"),
+          Top_P_Value = NA_real_,
+          Gene_Count = NA_integer_
+        ))
+      }
+    }
+  }
+  return(summary_df)
+}
+
+enrichment_summary <- create_summary(enrichment_results)
+
+DT::datatable(enrichment_summary,
+              caption = "GO Enrichment Results Summary",
+              options = list(pageLength = 15, scrollX = TRUE, dom = 'Bfrtip'),
+              filter = "top",
+              class = 'cell-border stripe hover') %>%
+  DT::formatSignif("Top_P_Value", digits = 3) %>%
+  DT::formatStyle(
+    "Group",
+    backgroundColor = DT::styleEqual(
+      names(group_colors), 
+      paste0(group_colors, "20")  # Add transparency
+    )
+  ) %>%
+  DT::formatStyle(
+    "Significant_Terms",
+    backgroundColor = DT::styleInterval(
+      cuts = c(0, 10, 50),
+      values = c("#ffcccc", "#ffffcc", "#ccffcc", "#ccffff")
+    )
+  )
+```
+
+## Summary
+
+```{r final-summary, results='asis'}
+# Processing summary
+processed_counts <- sapply(accessibility_regions, length)
+successful_processing <- sum(processed_counts > 0)
+
+cat("### Analysis Summary\n")
+cat(sprintf("- **Cell types processed:** %d/%d (%.1f%%)\n", 
+            successful_processing, length(all_cell_types),
+            100 * successful_processing / length(all_cell_types)))
+
+cat("- **Accessibility regions per group:**\n")
+for (g in names(region_counts)) {
+  cat(sprintf("  - %s: %s regions\n", g, format(region_counts[[g]], big.mark = ",")))
+}
+
+# Gene counts
+gene_counts <- sapply(Filter(Negate(is.null), enrichment_results), `[[`, "n_genes")
+if (length(gene_counts) > 0) {
+  cat("- **Genes analyzed per group:**\n")
+  for (g in names(gene_counts)) {
+    cat(sprintf("  - %s: %d genes\n", g, gene_counts[[g]]))
+  }
+}
+
+# Top significant terms with expanded ontology names
+significant_terms <- enrichment_summary %>%
+  filter(Significant_Terms > 0) %>%
+  group_by(Group) %>%
+  slice_min(Top_P_Value, n = 1) %>%
+  ungroup()
+
+if (nrow(significant_terms) > 0) {
+  cat("\n- **Most significant terms by group:**\n")
+  for (i in 1:nrow(significant_terms)) {
+    row <- significant_terms[i, ]
+    cat(sprintf("  - **%s (%s):** %s (p.adj = %.2e, n = %d genes)\n", 
+                row$Group, row$Ontology, row$Top_Term, 
+                row$Top_P_Value, row$Gene_Count))
+  }
+}
+
+cat(sprintf("\n*Analysis completed with %d workers on %s*\n", 
+            params$workers, Sys.info()['sysname']))
+```
